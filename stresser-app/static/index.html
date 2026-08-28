@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stresser Observability</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Stresser Observability</h1>
+        <p class="subtitle">Stress Testing & Observability Stack</p>
+
+        <div id="stressDisplay" class="stress-display low">0%</div>
+        <p class="label">Stress Level</p>
+
+        <input
+            type="range"
+            id="stressSlider"
+            min="0"
+            max="100"
+            value="0"
+            oninput="onSliderChange(this.value)"
+        />
+
+        <div class="info-grid">
+            <div class="info-card">
+                <div id="cpuWorkers" class="value">0</div>
+                <div class="desc">CPU Workers</div>
+            </div>
+            <div class="info-card">
+                <div id="currentLevel" class="value">0</div>
+                <div class="desc">Level Atual</div>
+            </div>
+        </div>
+
+        <div id="status" class="status">Aguardando...</div>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
