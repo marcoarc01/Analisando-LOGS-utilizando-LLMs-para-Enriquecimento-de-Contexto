@@ -14,18 +14,30 @@ import (
 var tracer = otel.Tracer("stresser-app")
 
 type Engine struct {
-	mu      sync.Mutex
-	level   int
-	workers int
-	cancel  []chan struct{}
+	mu         sync.Mutex
+	level      int
+	workers    int
+	cancel     []chan struct{}
+	maxWorkers int
+	worker     func(<-chan struct{})
 }
 
 func NewEngine() *Engine {
+	return newEngine(runtime.NumCPU(), cpuWorker)
+}
+
+func newEngine(maxWorkers int, worker func(<-chan struct{})) *Engine {
 	return &Engine{
-		level:   0,
-		workers: 0,
-		cancel:  make([]chan struct{}, 0),
+		level:      0,
+		workers:    0,
+		cancel:     make([]chan struct{}, 0),
+		maxWorkers: maxWorkers,
+		worker:     worker,
 	}
+}
+
+func ValidLevel(level int) bool {
+	return level >= 0 && level <= 100
 }
 
 func (e *Engine) GetLevel() int {
@@ -41,6 +53,10 @@ func (e *Engine) GetWorkers() int {
 }
 
 func (e *Engine) SetLevel(level int) {
+	if !ValidLevel(level) {
+		return
+	}
+
 	ctx := context.Background()
 	_, span := tracer.Start(ctx, "engine.SetLevel")
 	defer span.End()
@@ -61,20 +77,19 @@ func (e *Engine) SetLevel(level int) {
 	}
 	e.cancel = make([]chan struct{}, 0)
 
-	maxCPUs := runtime.NumCPU()
-	desiredWorkers := (level * maxCPUs) / 100
+	desiredWorkers := (level * e.maxWorkers) / 100
 
 	for i := 0; i < desiredWorkers; i++ {
 		ch := make(chan struct{})
 		e.cancel = append(e.cancel, ch)
-		go cpuWorker(ch)
+		go e.worker(ch)
 	}
 
 	e.workers = desiredWorkers
 
 	span.SetAttributes(
 		attribute.Int("stress.workers.count", desiredWorkers),
-		attribute.Int("stress.cpu.max", maxCPUs),
+		attribute.Int("stress.cpu.max", e.maxWorkers),
 	)
 
 	metrics.StressLevel.Set(float64(level))
@@ -85,7 +100,7 @@ func (e *Engine) SetLevel(level int) {
 		level, desiredWorkers, oldLevel)
 }
 
-func cpuWorker(stop chan struct{}) {
+func cpuWorker(stop <-chan struct{}) {
 	for {
 		select {
 		case <-stop:

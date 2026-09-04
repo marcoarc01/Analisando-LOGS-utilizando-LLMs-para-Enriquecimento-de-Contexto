@@ -24,7 +24,7 @@ type StressResponse struct {
 	CPUWorkers  int    `json:"cpu_workers"`
 }
 
-func StressHandler(engine *stress.Engine) http.HandlerFunc {
+func StressHandler(engine StressEngine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		ctx, span := tracer.Start(ctx, "POST /api/stress")
@@ -44,7 +44,7 @@ func StressHandler(engine *stress.Engine) http.HandlerFunc {
 
 		span.SetAttributes(attribute.Int("stress.level.requested", req.Level))
 
-		if req.Level < 0 || req.Level > 100 {
+		if !stress.ValidLevel(req.Level) {
 			span.SetStatus(codes.Error, "level fora do range")
 			span.SetAttributes(attribute.String("error.type", "invalid_range"))
 

@@ -19,17 +19,7 @@ func main() {
 	defer shutdown()
 
 	engine := stress.NewEngine()
-
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /health", handlers.HealthHandler)
-	mux.HandleFunc("GET /api/state", handlers.StateHandler(engine))
-	mux.HandleFunc("POST /api/stress", handlers.StressHandler(engine))
-	mux.Handle("GET /metrics", promhttp.Handler())
-
-	mux.Handle("GET /static/", handlers.StaticHandler())
-
-	mux.HandleFunc("GET /", handlers.UIHandler)
+	mux := newMux(engine)
 
 	port := os.Getenv("STRESSER_PORT")
 	if port == "" {
@@ -45,4 +35,15 @@ func main() {
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("Erro ao iniciar servidor: %v", err)
 	}
+}
+
+func newMux(engine handlers.StressEngine) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", handlers.HealthHandler)
+	mux.HandleFunc("GET /api/state", handlers.StateHandler(engine))
+	mux.HandleFunc("POST /api/stress", handlers.StressHandler(engine))
+	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.Handle("GET /static/", handlers.StaticHandler())
+	mux.HandleFunc("GET /", handlers.UIHandler)
+	return mux
 }
