@@ -70,13 +70,28 @@ func TestStressHandler(t *testing.T) {
 			wantLevel:    20,
 		},
 		{
-			name:           "missing level field uses zero",
-			body:           `{}`,
-			initialLevel:   20,
-			initialWorkers: 2,
-			wantStatus:     http.StatusOK,
-			wantResponse:   StressResponse{Message: "Stress level atualizado", StressLevel: 0, CPUWorkers: 0},
-			wantSetLevels:  []int{0},
+			name:         "missing level field",
+			body:         `{}`,
+			initialLevel: 20,
+			wantStatus:   http.StatusBadRequest,
+			wantError:    `{"error": "JSON inválido"}` + "\n",
+			wantLevel:    20,
+		},
+		{
+			name:          "maximum level",
+			body:          `{"level":100}`,
+			wantStatus:    http.StatusOK,
+			wantResponse:  StressResponse{Message: "Stress level atualizado", StressLevel: 100, CPUWorkers: 0},
+			wantSetLevels: []int{100},
+			wantLevel:     100,
+		},
+		{
+			name:          "trailing whitespace",
+			body:          "{\"level\":37}\n \t",
+			wantStatus:    http.StatusOK,
+			wantResponse:  StressResponse{Message: "Stress level atualizado", StressLevel: 37, CPUWorkers: 0},
+			wantSetLevels: []int{37},
+			wantLevel:     37,
 		},
 	}
 
@@ -119,6 +134,41 @@ func TestStressHandler(t *testing.T) {
 			}
 			if got != test.wantResponse {
 				t.Fatalf("response = %#v, want %#v", got, test.wantResponse)
+			}
+		})
+	}
+}
+
+func TestStressHandlerRejectsInvalidBodiesWithoutChangingState(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"null level", `{"level":null}`},
+		{"null body", `null`},
+		{"string level", `{"level":"20"}`},
+		{"fractional level", `{"level":20.5}`},
+		{"float level", `{"level":20.0}`},
+		{"boolean level", `{"level":true}`},
+		{"array body", `[20]`},
+		{"whitespace body", " \n\t"},
+		{"unknown field", `{"level":20,"extra":1}`},
+		{"second object", `{"level":20}{"level":0}`},
+		{"trailing null", `{"level":20} null`},
+		{"trailing text", `{"level":20} trailing`},
+		{"trailing invalid JSON", `{"level":20} {`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			engine := &stubEngine{level: 25, workers: 2}
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/api/stress", strings.NewReader(test.body))
+			StressHandler(engine)(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", response.Code)
+			}
+			if engine.level != 25 || engine.workers != 2 || len(engine.setLevels) != 0 {
+				t.Fatalf("invalid request changed engine state: %#v", engine)
 			}
 		})
 	}

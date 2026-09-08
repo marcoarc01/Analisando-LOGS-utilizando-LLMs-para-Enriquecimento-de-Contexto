@@ -1,1 +1,1 @@
-# Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto
+# Analisando Logs utilizando LLMs para Enriquecimento de Contexto

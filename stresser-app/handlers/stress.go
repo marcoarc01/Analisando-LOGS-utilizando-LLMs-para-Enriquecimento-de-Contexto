@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"log"
 	"net/http"
 
@@ -15,7 +17,7 @@ import (
 var tracer = otel.Tracer("stresser-app")
 
 type StressRequest struct {
-	Level int `json:"level"`
+	Level *int `json:"level"`
 }
 
 type StressResponse struct {
@@ -32,7 +34,18 @@ func StressHandler(engine StressEngine) http.HandlerFunc {
 
 		var req StressRequest
 
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		err := decoder.Decode(&req)
+		if err == nil {
+			if trailingErr := decoder.Decode(new(any)); trailingErr != io.EOF {
+				err = errors.New("conteúdo adicional depois do JSON")
+			}
+		}
+		if err == nil && req.Level == nil {
+			err = errors.New("level é obrigatório e deve ser inteiro")
+		}
+		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "JSON inválido")
 			span.SetAttributes(attribute.String("error.type", "invalid_json"))
@@ -42,9 +55,10 @@ func StressHandler(engine StressEngine) http.HandlerFunc {
 			return
 		}
 
-		span.SetAttributes(attribute.Int("stress.level.requested", req.Level))
+		level := *req.Level
+		span.SetAttributes(attribute.Int("stress.level.requested", level))
 
-		if !stress.ValidLevel(req.Level) {
+		if !stress.ValidLevel(level) {
 			span.SetStatus(codes.Error, "level fora do range")
 			span.SetAttributes(attribute.String("error.type", "invalid_range"))
 
@@ -53,18 +67,18 @@ func StressHandler(engine StressEngine) http.HandlerFunc {
 			return
 		}
 
-		engine.SetLevel(req.Level)
+		engine.SetLevel(level)
 
 		workers := engine.GetWorkers()
 		span.SetAttributes(
-			attribute.Int("stress.level.applied", req.Level),
+			attribute.Int("stress.level.applied", level),
 			attribute.Int("stress.workers", workers),
 		)
 		span.SetStatus(codes.Ok, "Stress level atualizado")
 
 		metrics.HTTPRequestsTotal.WithLabelValues("POST", "/api/stress", "200").Inc()
 
-		log.Printf("Stress alterado para %d%% (%d workers)", req.Level, workers)
+		log.Printf("Stress alterado para %d%% (%d workers)", level, workers)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

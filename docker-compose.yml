@@ -1,4 +1,22 @@
 services:
+  application-api:
+    image: application-api:1.0.0
+    build: ./application-api
+    environment:
+      - STRESSER_BASE_URL=${STRESSER_BASE_URL:-http://stresser-app:8080}
+      - STRESSER_TIMEOUT_SECONDS=${STRESSER_TIMEOUT_SECONDS:-2}
+      - EXPERIMENT_SEED=${EXPERIMENT_SEED:-42}
+      - MAX_EXPERIMENT_DELAY_MS=${MAX_EXPERIMENT_DELAY_MS:-2000}
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   stresser-app:
     image: stresser-observability:1.0.0
     build: ./stresser-app

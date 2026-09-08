@@ -44,6 +44,6 @@ func newMux(engine handlers.StressEngine) *http.ServeMux {
 	mux.HandleFunc("POST /api/stress", handlers.StressHandler(engine))
 	mux.Handle("GET /metrics", promhttp.Handler())
 	mux.Handle("GET /static/", handlers.StaticHandler())
-	mux.HandleFunc("GET /", handlers.UIHandler)
+	mux.HandleFunc("GET /{$}", handlers.UIHandler)
 	return mux
 }
