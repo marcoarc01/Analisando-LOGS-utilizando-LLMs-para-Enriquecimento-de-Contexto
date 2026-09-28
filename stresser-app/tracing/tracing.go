@@ -2,9 +2,10 @@ package tracing
 
 import (
 	"context"
-	"log"
 	"os"
 	"time"
+
+	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/telemetry"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -32,7 +33,8 @@ func InitTracer() func() {
 		otlptracegrpc.WithInsecure(),
 	)
 	if err != nil {
-		log.Fatalf("Erro ao criar OTLP exporter: %v", err)
+		telemetry.Logger.Error("Trace exporter initialization failed", "event", "tracing_init_failed")
+		os.Exit(1)
 	}
 
 	res, err := resource.New(ctx,
@@ -42,7 +44,8 @@ func InitTracer() func() {
 		),
 	)
 	if err != nil {
-		log.Fatalf("Erro ao criar resource: %v", err)
+		telemetry.Logger.Error("Trace resource initialization failed", "event", "tracing_init_failed")
+		os.Exit(1)
 	}
 
 	tp := sdktrace.NewTracerProvider(
@@ -52,19 +55,22 @@ func InitTracer() func() {
 	)
 
 	otel.SetTracerProvider(tp)
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		telemetry.Logger.Error("Trace export failed", "event", "trace_export_failed")
+	}))
 
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
 		propagation.Baggage{},
 	))
 
-	log.Printf("OpenTelemetry inicializado: endpoint=%s, service=%s", endpoint, serviceName)
+	telemetry.Logger.Info("Tracing initialized", "event", "tracing_initialized")
 
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := tp.Shutdown(ctx); err != nil {
-			log.Printf("Erro ao desligar TracerProvider: %v", err)
+			telemetry.Logger.Error("Tracing shutdown failed", "event", "tracing_shutdown_failed")
 		}
 	}
 }

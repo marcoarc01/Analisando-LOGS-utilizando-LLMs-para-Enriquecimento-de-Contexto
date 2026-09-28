@@ -2,11 +2,11 @@ package stress
 
 import (
 	"context"
-	"log"
 	"runtime"
 	"sync"
 
 	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/metrics"
+	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/telemetry"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -96,8 +96,8 @@ func (e *Engine) SetLevel(level int) {
 	metrics.StressCPUWorkers.Set(float64(desiredWorkers))
 	metrics.StressChangesTotal.Inc()
 
-	log.Printf(`{"level":"info","component":"engine","stress":%d,"workers":%d,"old_level":%d,"msg":"stress updated"}`,
-		level, desiredWorkers, oldLevel)
+	telemetry.Logger.Info("Stress setting updated", "event", "stress_updated",
+		"stress_level", level, "cpu_workers", desiredWorkers, "old_stress_level", oldLevel)
 }
 
 func cpuWorker(stop <-chan struct{}) {

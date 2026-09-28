@@ -8,6 +8,8 @@ from app.stresser_client import StresserUnavailable
 
 @dataclass
 class ExperimentContext:
+    request_id: str | None = None
+    experiment_run_id: str | None = None
     stress_level: int | None = None
     delay_ms: float = 0
     degradation_type: str = "none"
@@ -19,7 +21,10 @@ async def apply_experiment(
 ) -> JSONResponse | None:
     metrics = state.metrics
     try:
-        context.stress_level = await state.stresser.get_level()
+        context.stress_level = await state.stresser.get_level(
+            request_id=context.request_id,
+            experiment_run_id=context.experiment_run_id,
+        )
         metrics.stress.set(context.stress_level)
     except StresserUnavailable:
         metrics.lookup_failures.inc()

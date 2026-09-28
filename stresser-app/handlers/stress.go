@@ -4,10 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 
-	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/metrics"
 	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/stress"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -50,7 +48,6 @@ func StressHandler(engine StressEngine) http.HandlerFunc {
 			span.SetStatus(codes.Error, "JSON inválido")
 			span.SetAttributes(attribute.String("error.type", "invalid_json"))
 
-			metrics.HTTPRequestsTotal.WithLabelValues("POST", "/api/stress", "400").Inc()
 			http.Error(w, `{"error": "JSON inválido"}`, http.StatusBadRequest)
 			return
 		}
@@ -62,7 +59,6 @@ func StressHandler(engine StressEngine) http.HandlerFunc {
 			span.SetStatus(codes.Error, "level fora do range")
 			span.SetAttributes(attribute.String("error.type", "invalid_range"))
 
-			metrics.HTTPRequestsTotal.WithLabelValues("POST", "/api/stress", "400").Inc()
 			http.Error(w, `{"error": "level deve ser entre 0 e 100"}`, http.StatusBadRequest)
 			return
 		}
@@ -75,10 +71,6 @@ func StressHandler(engine StressEngine) http.HandlerFunc {
 			attribute.Int("stress.workers", workers),
 		)
 		span.SetStatus(codes.Ok, "Stress level atualizado")
-
-		metrics.HTTPRequestsTotal.WithLabelValues("POST", "/api/stress", "200").Inc()
-
-		log.Printf("Stress alterado para %d%% (%d workers)", level, workers)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

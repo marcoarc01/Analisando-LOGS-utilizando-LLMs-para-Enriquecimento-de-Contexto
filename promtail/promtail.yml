@@ -10,6 +10,16 @@ clients:
 
 scrape_configs:
   - job_name: docker-logs
+    pipeline_stages:
+      - docker: {}
+      - json:
+          expressions:
+            app_service: service
+      - template:
+          source: app_service
+          template: '{{ if or (eq .Value "application-api") (eq .Value "stresser-app") }}{{ .Value }}{{ end }}'
+      - labels:
+          service: app_service
     static_configs:
       - targets:
           - localhost

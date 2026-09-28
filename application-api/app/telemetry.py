@@ -5,19 +5,78 @@ from datetime import datetime, timezone
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
+# Control fields remain in raw logs for audit only. Future model inputs must
+# exclude status_code, stress_level, degradation_type, experiment_run_id,
+# request_id, scenario and testid (and event names that reveal the intervention).
+MESSAGES = {
+    "products_completed": "Product request completed",
+    "order_created": "Order request completed",
+    "health_checked": "Health request completed",
+    "request_rejected": "Request rejected",
+    "latency_injected": "Request delayed",
+    "experimental_500": "Request failed",
+    "experimental_503": "Request unavailable",
+    "stresser_lookup_failed": "Dependency lookup failed",
+}
+
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
+        fields = getattr(record, "event_fields", {})
+        event = record.getMessage() if fields else "service_log"
+        message = MESSAGES.get(event, "Service lifecycle updated")
+        if record.name.startswith("uvicorn"):
+            # Do not serialize arbitrary exception text, URLs, headers or bodies.
+            event = (
+                "server_error"
+                if record.levelno >= logging.ERROR
+                else "service_lifecycle"
+            )
+            message = (
+                "Server operation failed"
+                if record.levelno >= logging.ERROR
+                else "Service lifecycle updated"
+            )
+            template = str(record.msg)
+            if template == "Application startup complete.":
+                event, message = "service_started", "Service started"
+            elif template == "Application shutdown complete.":
+                event, message = "service_stopped", "Service stopped"
         return json.dumps(
             {
-                **record.event_fields,
+                **fields,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "level": record.levelname.lower(),
                 "service": "application-api",
-                "event": record.getMessage(),
+                "event": event,
+                "message": message,
             },
             ensure_ascii=False,
         )
+
+
+def server_log_config():
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {"json": {"()": JsonFormatter}},
+        "handlers": {
+            "stdout": {
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+                "formatter": "json",
+            }
+        },
+        "loggers": {
+            "uvicorn": {"handlers": ["stdout"], "level": "INFO", "propagate": False},
+            "uvicorn.error": {
+                "handlers": ["stdout"],
+                "level": "INFO",
+                "propagate": False,
+            },
+            "uvicorn.access": {"handlers": [], "propagate": False},
+        },
+    }
 
 
 def create_logger() -> logging.Logger:

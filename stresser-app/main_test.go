@@ -1,14 +1,83 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/metrics"
+	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/stress"
+	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/telemetry"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
 
 type routerEngine struct {
 	setCalls int
+}
+
+func TestHTTPInstrumentationAndSingleStressEvent(t *testing.T) {
+	var output bytes.Buffer
+	previous := telemetry.Logger
+	telemetry.Logger = telemetry.NewLogger(&output)
+	defer func() { telemetry.Logger = previous }()
+	router := metrics.MetricsMiddleware(newMux(stress.NewEngine()))
+	for _, tc := range []struct {
+		method, path, body string
+		code               int
+	}{
+		{"GET", "/api/state", "", 200},
+		{"POST", "/api/state", "", 405},
+		{"POST", "/api/stress", `{"level":null}`, 400},
+		{"POST", "/api/stress", `{"level":0}`, 200},
+		{"GET", "/customer/private-user", "", 404},
+	} {
+		metric := metrics.HTTPRequestsTotal.WithLabelValues(tc.method, metrics.NormalizedPath(tc.path), strconv.Itoa(tc.code))
+		before := testutil.ToFloat64(metric)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body)))
+		if response.Code != tc.code || testutil.ToFloat64(metric)-before != 1 {
+			t.Fatal("incorrect request count/status", tc)
+		}
+	}
+	updates := 0
+	for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+		var record map[string]any
+		if json.Unmarshal([]byte(line), &record) != nil {
+			t.Fatal("non-JSON log", line)
+		}
+		if record["event"] == "stress_updated" {
+			updates++
+			for _, key := range []string{"timestamp", "level", "service", "event", "message", "stress_level", "cpu_workers", "old_stress_level"} {
+				if _, ok := record[key]; !ok {
+					t.Fatal("missing field", key)
+				}
+			}
+			for _, key := range []string{"method", "route", "status_code", "degradation_type"} {
+				if _, ok := record[key]; ok {
+					t.Fatal("inapplicable field", key)
+				}
+			}
+		}
+	}
+	if updates != 1 {
+		t.Fatalf("stress_updated count=%d", updates)
+	}
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest("GET", "/metrics", nil))
+	text := response.Body.String()
+	for _, sensitive := range []string{"private-user", "request_id=", "experiment_run_id="} {
+		if strings.Contains(text, sensitive) {
+			t.Fatal("unbounded metric label", sensitive)
+		}
+	}
+	for _, name := range []string{"stress_level", "stress_cpu_workers", "stress_changes_total", "http_requests_total", "http_request_duration_seconds_count"} {
+		if !strings.Contains(text, name) {
+			t.Fatal("missing metric", name)
+		}
+	}
 }
 
 func (routerEngine) GetLevel() int {

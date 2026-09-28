@@ -1,8 +1,9 @@
 package metrics
 
 import (
+	"github.com/felixge/httpsnoop"
 	"net/http"
-	"time"
+	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -35,11 +36,27 @@ var HTTPRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 
 func MetricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-
-		next.ServeHTTP(w, r)
-
-		duration := time.Since(start).Seconds()
-		HTTPRequestDuration.WithLabelValues(r.URL.Path, r.Method).Observe(duration)
+		measurement := httpsnoop.CaptureMetrics(next, w, r)
+		path, method := NormalizedPath(r.URL.Path), normalizedMethod(r.Method)
+		HTTPRequestsTotal.WithLabelValues(method, path, strconv.Itoa(measurement.Code)).Inc()
+		HTTPRequestDuration.WithLabelValues(path, method).Observe(measurement.Duration.Seconds())
 	})
+}
+
+func NormalizedPath(path string) string {
+	switch path {
+	case "/", "/health", "/metrics", "/api/state", "/api/stress":
+		return path
+	default:
+		return "__unmatched__"
+	}
+}
+
+func normalizedMethod(method string) string {
+	switch method {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT":
+		return method
+	default:
+		return "OTHER"
+	}
 }

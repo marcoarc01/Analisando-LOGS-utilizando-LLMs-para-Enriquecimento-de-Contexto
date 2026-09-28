@@ -105,6 +105,7 @@ def test_logs_json_and_correlation(environment):
             "level",
             "service",
             "event",
+            "message",
             "method",
             "route",
             "status_code",

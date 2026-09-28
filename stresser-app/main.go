@@ -9,12 +9,15 @@ import (
 	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/handlers"
 	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/metrics"
 	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/stress"
+	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/telemetry"
 	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/tracing"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 func main() {
+	log.SetFlags(0)
+	log.SetOutput(telemetry.ErrorWriter{})
 	shutdown := tracing.InitTracer()
 	defer shutdown()
 
@@ -27,13 +30,13 @@ func main() {
 	}
 
 	addr := fmt.Sprintf(":%s", port)
-	log.Printf("Stresser App rodando em http://localhost%s", addr)
-	log.Printf("Metricas em http://localhost%s/metrics", addr)
+	telemetry.Logger.Info("Service started", "event", "service_started")
 
 	handler := otelhttp.NewHandler(metrics.MetricsMiddleware(mux), "stresser-app")
 
 	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatalf("Erro ao iniciar servidor: %v", err)
+		telemetry.Logger.Error("Server startup failed", "event", "server_start_failed")
+		os.Exit(1)
 	}
 }
 

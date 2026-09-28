@@ -13,6 +13,8 @@ EXPERIMENTAL_ROUTES = {
     ("POST", "/orders"): "order_created",
     ("GET", "/health"): "health_checked",
 }
+# /live and /ready are operational probes, excluded from experimental logs.
+# /metrics access logging is deliberately disabled to avoid scrape noise.
 KNOWN_ROUTES = {
     "/products",
     "/orders",
@@ -57,13 +59,19 @@ class ExperimentMiddleware:
             method,
             route,
         ) == ("GET", "/ready")
-        request_id = str(uuid4())
-        run_id = Headers(scope=scope).get("X-Experiment-Run-Id", "")
+        headers = Headers(scope=scope)
+        request_id = headers.get("X-Request-ID", "")
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id):
+            request_id = str(uuid4())
+        run_id = headers.get("X-Experiment-Run-ID", "")
         fields = {"method": method, "route": route, "request_id": request_id}
         if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", run_id):
             fields["experiment_run_id"] = run_id
 
-        context = ExperimentContext()
+        context = ExperimentContext(
+            request_id=request_id,
+            experiment_run_id=fields.get("experiment_run_id"),
+        )
         scope.setdefault("state", {})["experiment"] = context
         status_code = 500
         override = None
@@ -73,6 +81,10 @@ class ExperimentMiddleware:
             if message["type"] == "http.response.start":
                 status_code = message["status"]
                 MutableHeaders(scope=message)["X-Request-Id"] = request_id
+                if context.experiment_run_id:
+                    MutableHeaders(scope=message)["X-Experiment-Run-ID"] = (
+                        context.experiment_run_id
+                    )
             await send(message)
 
         if needs_lookup:

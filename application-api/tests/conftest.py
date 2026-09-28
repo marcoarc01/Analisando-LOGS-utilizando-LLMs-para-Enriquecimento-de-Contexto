@@ -19,11 +19,12 @@ def anyio_backend():
 @pytest.fixture
 def environment():
     env = SimpleNamespace(
-        level=0, calls=0, error=None, sleep=AsyncMock(), logs=StringIO()
+        level=0, calls=0, requests=[], error=None, sleep=AsyncMock(), logs=StringIO()
     )
 
     def handler(request):
         env.calls += 1
+        env.requests.append(request)
         if env.error:
             raise env.error
         return httpx.Response(200, json={"stress_level": env.level, "cpu_workers": 0})

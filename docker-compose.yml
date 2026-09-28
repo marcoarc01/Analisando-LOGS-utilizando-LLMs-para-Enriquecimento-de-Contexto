@@ -37,6 +37,10 @@ services:
 
   prometheus:
     image: prom/prometheus:v3.11.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-remote-write-receiver
     ports:
       - "9090:9090"
     volumes:
@@ -104,6 +108,25 @@ services:
     restart: unless-stopped
     depends_on:
       - tempo
+
+  k6:
+    image: grafana/k6:1.8.1
+    profiles: [loadtest]
+    restart: "no"
+    environment:
+      K6_BASE_URL: ${K6_BASE_URL:-http://application-api:8000}
+      K6_TEST_DURATION: ${K6_TEST_DURATION:-30s}
+      K6_EXPERIMENT_RUN_ID: ${K6_EXPERIMENT_RUN_ID:-}
+      K6_SCENARIO: ${K6_SCENARIO:-baseline}
+      K6_MAX_EXPERIMENT_DELAY_MS: ${MAX_EXPERIMENT_DELAY_MS:-2000}
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_TREND_STATS: avg,p(50),p(95),p(99),max
+      K6_NO_USAGE_REPORT: "true"
+    volumes:
+      - ./load-tests:/scripts:ro
+    command: [run, --quiet, --out, experimental-prometheus-rw, /scripts/baseline.js]
+    logging:
+      driver: "none"
 
 volumes:
   grafana-data:
