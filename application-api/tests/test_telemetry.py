@@ -67,5 +67,6 @@ def test_server_entrypoint_uses_json_logs(monkeypatch):
     runpy.run_module("app.server", run_name="__main__")
     args, options = calls[0]
     assert args == ("app.main:app",)
+    assert options["timeout_keep_alive"] == 30
     assert options["access_log"] is False
     assert options["log_config"]["formatters"]["json"]["()"] is JsonFormatter

@@ -10,6 +10,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         workers=1,
+        timeout_keep_alive=30,
         access_log=False,
         log_config=server_log_config(),
     )
