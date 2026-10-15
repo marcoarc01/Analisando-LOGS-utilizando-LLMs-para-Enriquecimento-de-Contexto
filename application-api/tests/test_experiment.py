@@ -57,7 +57,47 @@ def test_unavailable_dependency(environment, path, error):
     assert math.isnan(environment.app.state.metrics.stress._value.get())
     output = environment.logs.getvalue()
     assert "secret-" not in output
-    assert json.loads(output)["event"] == "stresser_lookup_failed"
+    record = json.loads(output)
+    assert record["event"] == "stresser_lookup_failed"
+    assert record["level"] == "error"
+    assert record["message"] == "Dependency lookup failed"
+    assert record["error_type"] == type(error).__name__
+
+
+@pytest.mark.parametrize(
+    "error_class",
+    [
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.ConnectError,
+        httpx.RemoteProtocolError,
+    ],
+)
+def test_lookup_failure_log_has_no_dependency_address(environment, error_class):
+    environment.error = error_class(
+        "GET http://toxiproxy:8666/api/state via stresser-app:8080 failed"
+    )
+    environment.client.get("/products", headers={"X-Request-ID": "req-1"})
+    record = json.loads(environment.logs.getvalue())
+    assert record["error_type"] == error_class.__name__
+    for key, value in record.items():
+        if key == "timestamp":
+            continue
+        text = f"{key}={value}".lower()
+        for forbidden in ("toxiproxy", "8666", "8080", "stresser-app", "http", "://"):
+            assert forbidden not in text, (key, value)
+
+
+@pytest.mark.parametrize(
+    ("level", "path", "expected"),
+    [(0, "/products", "info"), (100, "/products", "error")],
+)
+def test_log_level_by_status(environment, level, path, expected):
+    environment.level = level
+    experimental_call(environment.client, path)
+    records = [json.loads(line) for line in environment.logs.getvalue().splitlines()]
+    assert records[-1]["level"] == expected
+    assert "error_type" not in records[-1]
 
 
 @pytest.mark.parametrize(

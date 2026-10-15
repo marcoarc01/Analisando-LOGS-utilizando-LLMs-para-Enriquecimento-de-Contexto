@@ -1,6 +1,6 @@
 # Validação funcional com k6
 
-A imagem grafana/k6:1.8.1 envia 8,1 requisições por segundo para a FastAPI.
+A imagem grafana/k6:1.8.1 envia 8,53 requisições por segundo para a FastAPI.
 Cada execução dura 30 segundos por padrão e deve ser executada sequencialmente.
 O teste não altera o stress; use o endpoint de controle antes de cada execução.
 
@@ -27,7 +27,7 @@ sempre o launcher. Ctrl+C encerra o container pertencente à execução.
 | Variável | Uso |
 | --- | --- |
 | K6_EXPERIMENT_RUN_ID | UUID v4 obrigatório, fornecido pelo launcher via --testid |
-| K6_SCENARIO | baseline, stress_cpu ou recovery |
+| K6_SCENARIO | baseline, stress_cpu, recovery, network_latency, network_timeout ou combined |
 | K6_TEST_DURATION | 30s por padrão; inteiro positivo seguido de s, m ou h |
 | K6_BASE_URL | Origem HTTP sem caminho, query ou credenciais |
 | K6_MAX_EXPERIMENT_DELAY_MS | Recebe MAX_EXPERIMENT_DELAY_MS do Compose, padrão 2000 |
@@ -37,9 +37,12 @@ sempre o launcher. Ctrl+C encerra o container pertencente à execução.
 | products | 53/10s (5,3/s) | 27 | 38 | 159 |
 | orders | 19/10s (1,9/s) | 10 | 14 | 57 |
 | health | 9/10s (0,9/s) | 5 | 7 | 27 |
+| invalid | 43/100s (0,43/s) | 3 | 4 | 13 |
 
-Os intervalos entre chegadas (188,7, 526,3 e 1.111,1 ms) não são múltiplos
+Os intervalos entre chegadas (188,7, 526,3, 1.111,1 e 2.325,6 ms) não são múltiplos
 de 100 ms, para não travar na fase do ciclo de cota de CPU do stresser-app.
+O fluxo invalid (~5% do total) alterna POST /orders com produto inexistente (404)
+e quantidade 0 (422); ambos são respostas esperadas e não consultam o Go.
 
 Capacidade: ceil(taxa por segundo × (atraso máximo em segundos + 3)) pré-alocados e
 ceil(taxa × (atraso máximo em segundos + 5)) máximos. A margem cobre a consulta
@@ -47,7 +50,8 @@ ceil(taxa × (atraso máximo em segundos + 5)) máximos. A margem cobre a consul
 As taxas de chegada não mudam com o stress.
 
 Thresholds exigem zero dropped_iterations, preservação de headers em 100% das
-requisições e pelo menos 98% da quantidade prevista em cada endpoint.
+requisições, 100% dos checks do fluxo invalid e pelo menos 98% da quantidade
+prevista em cada endpoint.
 O resumo calcula requests_per_scheduled_second usando os 30s de carga.
 A duração total do processo inclui inicialização e drenagem; dividir requisições
 por esse tempo total subestima a taxa de chegada. Uma iteração na borda pode
@@ -55,7 +59,8 @@ produzir até uma requisição extra por executor.
 
 Os checks de status continuam esperando 200/201 e falham deliberadamente para
 500/503 experimentais. Esses checks não abortam os testes de stress.
-Os pedidos usam apenas {"product_id":1,"quantity":2}.
+Os pedidos válidos usam apenas {"product_id":1,"quantity":2}; o fluxo invalid usa
+{"product_id":999,"quantity":2} e {"product_id":1,"quantity":0}.
 
 ## Métricas
 

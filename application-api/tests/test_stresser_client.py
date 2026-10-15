@@ -37,6 +37,9 @@ async def test_success_reuses_client_and_timeout():
         httpx.ReadTimeout,
         httpx.ConnectTimeout,
         httpx.RemoteProtocolError,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+        httpx.ReadError,
     ],
 )
 async def test_transport_failure_without_retry(error_type):
@@ -49,9 +52,12 @@ async def test_transport_failure_without_retry(error_type):
 
     client = StresserClient(Settings(), httpx.MockTransport(handler))
     try:
-        with pytest.raises(StresserUnavailable, match="^Dependência indisponível$"):
+        with pytest.raises(
+            StresserUnavailable, match="^Dependência indisponível$"
+        ) as raised:
             await client.get_level()
         assert calls == 1
+        assert raised.value.error_type == error_type.__name__
     finally:
         await client.aclose()
 
@@ -78,8 +84,9 @@ async def test_invalid_response(body):
         httpx.MockTransport(lambda request: httpx.Response(200, content=body)),
     )
     try:
-        with pytest.raises(StresserUnavailable):
+        with pytest.raises(StresserUnavailable) as raised:
             await client.get_level()
+        assert raised.value.error_type == "InvalidResponse"
     finally:
         await client.aclose()
 
@@ -95,9 +102,10 @@ async def test_non_success_response(status):
 
     client = StresserClient(Settings(), httpx.MockTransport(handler))
     try:
-        with pytest.raises(StresserUnavailable):
+        with pytest.raises(StresserUnavailable) as raised:
             await client.get_level()
         assert len(calls) == 1
+        assert raised.value.error_type == "UnexpectedStatus"
     finally:
         await client.aclose()
 

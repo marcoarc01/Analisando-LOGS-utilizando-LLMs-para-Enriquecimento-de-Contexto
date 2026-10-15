@@ -13,6 +13,7 @@ MESSAGES = {
     "order_created": "Order request completed",
     "health_checked": "Health request completed",
     "request_rejected": "Request rejected",
+    "product_not_found": "Product not found",
     "latency_injected": "Request delayed",
     "experimental_500": "Request failed",
     "experimental_503": "Request unavailable",

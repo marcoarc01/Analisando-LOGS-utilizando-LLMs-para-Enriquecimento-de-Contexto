@@ -22,6 +22,7 @@ async def create_order(
 ) -> OrderResponse | Response:
     product = next((item for item in PRODUCTS if item.id == order.product_id), None)
     if product is None:
+        request.state.experiment.event = "product_not_found"
         raise HTTPException(status_code=404, detail="Produto não encontrado")
 
     override = await apply_experiment(request.app.state, request.state.experiment)

@@ -76,7 +76,14 @@ def test_invalid_orders_skip_experiment(environment, body, status, go_available)
         == 1
     )
     record = json.loads(environment.logs.getvalue())
-    assert record["event"] == "request_rejected"
+    if status == 404:
+        assert record["event"] == "product_not_found"
+        assert record["message"] == "Product not found"
+    else:
+        assert record["event"] == "request_rejected"
+        assert record["message"] == "Request rejected"
+    assert record["level"] == "warning"
+    assert "error_type" not in record
     assert record["status_code"] == status
     assert record["stress_level"] is None
     assert record["degradation_type"] == "none"

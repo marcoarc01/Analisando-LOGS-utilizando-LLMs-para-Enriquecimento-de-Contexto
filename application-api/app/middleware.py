@@ -108,11 +108,18 @@ class ExperimentMiddleware:
                     stress_level=context.stress_level,
                     degradation_type=context.degradation_type,
                 )
+                if context.error_type:
+                    fields["error_type"] = context.error_type
                 if context.delay_ms > 0:
                     state.logger.info(
                         "latency_injected", extra={"event_fields": fields}
                     )
-                log_level = logging.ERROR if status_code >= 500 else logging.INFO
+                if status_code >= 500:
+                    log_level = logging.ERROR
+                elif status_code >= 400:
+                    log_level = logging.WARNING
+                else:
+                    log_level = logging.INFO
                 state.logger.log(
                     log_level, context.event, extra={"event_fields": fields}
                 )

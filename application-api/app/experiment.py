@@ -14,6 +14,7 @@ class ExperimentContext:
     delay_ms: float = 0
     degradation_type: str = "none"
     event: str = "request_rejected"
+    error_type: str | None = None
 
 
 async def apply_experiment(
@@ -26,11 +27,12 @@ async def apply_experiment(
             experiment_run_id=context.experiment_run_id,
         )
         metrics.stress.set(context.stress_level)
-    except StresserUnavailable:
+    except StresserUnavailable as error:
         metrics.lookup_failures.inc()
         metrics.stress.set(float("nan"))
         context.degradation_type = "dependency_unavailable"
         context.event = "stresser_lookup_failed"
+        context.error_type = error.error_type
         return JSONResponse({"detail": "Dependência indisponível"}, status_code=503)
 
     if not degrade:

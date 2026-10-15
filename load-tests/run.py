@@ -21,7 +21,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--testid", required=True)
     parser.add_argument(
-        "--scenario", choices=["baseline", "stress_cpu", "recovery"], required=True
+        "--scenario",
+        choices=[
+            "baseline",
+            "stress_cpu",
+            "recovery",
+            "network_latency",
+            "network_timeout",
+            "combined",
+        ],
+        required=True,
     )
     args = parser.parse_args()
     if not re.fullmatch(

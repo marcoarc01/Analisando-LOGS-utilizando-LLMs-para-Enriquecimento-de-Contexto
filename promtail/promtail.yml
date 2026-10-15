@@ -20,6 +20,11 @@ scrape_configs:
           template: '{{ if or (eq .Value "application-api") (eq .Value "stresser-app") }}{{ .Value }}{{ end }}'
       - labels:
           service: app_service
+      # Only application logs reach Loki; lines without service (infra, non-JSON) are dropped.
+      - match:
+          selector: '{job="docker", service!~"application-api|stresser-app"}'
+          action: drop
+          drop_counter_reason: non_application_log
     static_configs:
       - targets:
           - localhost
