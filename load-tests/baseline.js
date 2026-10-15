@@ -24,17 +24,20 @@ if (!/^[1-9]\d*(s|m|h)$/.test(duration)) {
 }
 
 const durationSeconds = Number(duration.slice(0, -1)) * { s: 1, m: 60, h: 3600 }[duration.slice(-1)];
+// Rates are iterations per 10 s: arrival intervals (188.7/526.3/1111.1 ms) are not
+// multiples of 100 ms, so arrivals do not lock onto the CPU quota (CFS) period.
+const timeUnitSeconds = 10;
 
 function scenario(exec, rate, endpoint) {
   return {
     executor: 'constant-arrival-rate',
     exec,
     rate,
-    timeUnit: '1s',
+    timeUnit: `${timeUnitSeconds}s`,
     duration,
-    // Delay + dependency budget + scheduling margin (25/10/5 at 2000 ms).
-    preAllocatedVUs: Math.ceil(rate * (maxDelayMs / 1000 + 3)),
-    maxVUs: Math.ceil(rate * (maxDelayMs / 1000 + 5)),
+    // Delay + dependency budget + scheduling margin (27/10/5 at 2000 ms).
+    preAllocatedVUs: Math.ceil((rate * (maxDelayMs + 3000)) / (timeUnitSeconds * 1000)),
+    maxVUs: Math.ceil((rate * (maxDelayMs + 5000)) / (timeUnitSeconds * 1000)),
     gracefulStop: '5s',
     tags: { endpoint },
   };
@@ -42,9 +45,9 @@ function scenario(exec, rate, endpoint) {
 
 export const options = {
   scenarios: {
-    products: scenario('products', 5, '/products'),
-    orders: scenario('orders', 2, '/orders'),
-    health: scenario('health', 1, '/health'),
+    products: scenario('products', 53, '/products'),
+    orders: scenario('orders', 19, '/orders'),
+    health: scenario('health', 9, '/health'),
   },
   systemTags: ['method', 'status', 'check', 'expected_response'],
   // testid cardinality grows only with the controlled number of experiments.
@@ -54,9 +57,9 @@ export const options = {
   summaryTrendStats: ['avg', 'p(50)', 'p(95)', 'p(99)', 'max'],
   thresholds: {
     dropped_iterations: ['count==0'],
-    'http_reqs{endpoint:/products}': [`count>=${Math.floor(5 * durationSeconds * 0.98)}`],
-    'http_reqs{endpoint:/orders}': [`count>=${Math.floor(2 * durationSeconds * 0.98)}`],
-    'http_reqs{endpoint:/health}': [`count>=${Math.floor(durationSeconds * 0.98)}`],
+    'http_reqs{endpoint:/products}': [`count>=${Math.floor((53 * durationSeconds * 0.98) / timeUnitSeconds)}`],
+    'http_reqs{endpoint:/orders}': [`count>=${Math.floor((19 * durationSeconds * 0.98) / timeUnitSeconds)}`],
+    'http_reqs{endpoint:/health}': [`count>=${Math.floor((9 * durationSeconds * 0.98) / timeUnitSeconds)}`],
     'checks{check:correlation headers preserved}': ['rate==1'],
   },
 };

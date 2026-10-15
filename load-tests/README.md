@@ -1,6 +1,6 @@
 # Validação funcional com k6
 
-A imagem grafana/k6:1.8.1 envia 8 requisições por segundo para a FastAPI.
+A imagem grafana/k6:1.8.1 envia 8,1 requisições por segundo para a FastAPI.
 Cada execução dura 30 segundos por padrão e deve ser executada sequencialmente.
 O teste não altera o stress; use o endpoint de controle antes de cada execução.
 
@@ -34,11 +34,14 @@ sempre o launcher. Ctrl+C encerra o container pertencente à execução.
 
 | Executor | Taxa | preAllocatedVUs | maxVUs | Esperado em 30s |
 | --- | --- | --- | --- | --- |
-| products | 5/s | 25 | 35 | 150 |
-| orders | 2/s | 10 | 14 | 60 |
-| health | 1/s | 5 | 7 | 30 |
+| products | 53/10s (5,3/s) | 27 | 38 | 159 |
+| orders | 19/10s (1,9/s) | 10 | 14 | 57 |
+| health | 9/10s (0,9/s) | 5 | 7 | 27 |
 
-Capacidade: ceil(taxa × (atraso máximo em segundos + 3)) pré-alocados e
+Os intervalos entre chegadas (188,7, 526,3 e 1.111,1 ms) não são múltiplos
+de 100 ms, para não travar na fase do ciclo de cota de CPU do stresser-app.
+
+Capacidade: ceil(taxa por segundo × (atraso máximo em segundos + 3)) pré-alocados e
 ceil(taxa × (atraso máximo em segundos + 5)) máximos. A margem cobre a consulta
 à dependência e o agendamento. Timeout HTTP: 5s; gracefulStop: 5s.
 As taxas de chegada não mudam com o stress.

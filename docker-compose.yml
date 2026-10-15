@@ -3,7 +3,7 @@ services:
     image: application-api:1.0.0
     build: ./application-api
     environment:
-      - STRESSER_BASE_URL=${STRESSER_BASE_URL:-http://stresser-app:8080}
+      - STRESSER_BASE_URL=${STRESSER_BASE_URL:-http://toxiproxy:8666}
       - STRESSER_TIMEOUT_SECONDS=${STRESSER_TIMEOUT_SECONDS:-2}
       - EXPERIMENT_SEED=${EXPERIMENT_SEED:-42}
       - MAX_EXPERIMENT_DELAY_MS=${MAX_EXPERIMENT_DELAY_MS:-2000}
@@ -16,6 +16,22 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    depends_on:
+      - toxiproxy
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    ports:
+      - "127.0.0.1:8474:8474"
+    volumes:
+      - ./toxiproxy/toxiproxy.json:/config/toxiproxy.json:ro
+    restart: unless-stopped
+    depends_on:
+      - stresser-app
+    # Driver local: logs fora de /var/lib/docker/containers/*/*.log, fora do Promtail.
+    logging:
+      driver: local
 
   stresser-app:
     image: stresser-observability:1.0.0
@@ -76,13 +92,16 @@ services:
       - ./loki/loki-config.yml:/etc/loki/local-config.yml
       - loki-data:/loki
     command: -config.file=/etc/loki/local-config.yml
+    restart: unless-stopped
 
   promtail:
     image: grafana/promtail:2.9.3
     volumes:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - ./promtail/promtail.yml:/etc/promtail/promtail.yml
+      - promtail-positions:/var/lib/promtail
     command: -config.file=/etc/promtail/promtail.yml
+    restart: unless-stopped
     depends_on:
       - loki
 
@@ -133,5 +152,7 @@ volumes:
   prometheus-data:
   loki-data:
     name: loki-data
+  promtail-positions:
+    name: promtail-positions
   tempo-data:
     name: tempo-data

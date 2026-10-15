@@ -27,15 +27,23 @@ test('requires neutral testid and controlled scenario', () => {
 test('capacity, arrival rates, percentiles and thresholds', () => {
   for (const delay of [0, 2000, 4000]) {
     const { options } = load({ K6_EXPERIMENT_RUN_ID: id, K6_MAX_EXPERIMENT_DELAY_MS: String(delay) });
-    for (const [name, rate] of [['products', 5], ['orders', 2], ['health', 1]]) {
+    for (const [name, rate] of [['products', 53], ['orders', 19], ['health', 9]]) {
       const s = options.scenarios[name];
       assert.equal(s.rate, rate);
+      assert.equal(s.timeUnit, '10s');
       assert.equal(s.duration, '30s');
-      assert.ok(s.preAllocatedVUs > rate * delay / 1000);
+      assert.notEqual((10000 / rate) % 100, 0);
+      assert.ok(s.preAllocatedVUs > (rate / 10) * delay / 1000);
       assert.ok(s.maxVUs > s.preAllocatedVUs);
     }
     for (const p of ['avg', 'p(50)', 'p(95)', 'p(99)', 'max']) assert.ok(options.summaryTrendStats.includes(p));
     assert.equal(options.thresholds.dropped_iterations[0], 'count==0');
+  }
+  const { options } = load({ K6_EXPERIMENT_RUN_ID: id });
+  for (const [name, pre, max, minimum] of [['products', 27, 38, 155], ['orders', 10, 14, 55], ['health', 5, 7, 26]]) {
+    assert.equal(options.scenarios[name].preAllocatedVUs, pre);
+    assert.equal(options.scenarios[name].maxVUs, max);
+    assert.equal(options.thresholds[`http_reqs{endpoint:/${name}}`][0], `count>=${minimum}`);
   }
   const compose = readFileSync(`${__dirname}/../docker-compose.yml`, 'utf8');
   assert.match(compose, /K6_PROMETHEUS_RW_TREND_STATS: avg,p\(50\),p\(95\),p\(99\),max/);

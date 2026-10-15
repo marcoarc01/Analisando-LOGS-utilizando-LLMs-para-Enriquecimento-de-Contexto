@@ -1,0 +1,8 @@
+[
+  {
+    "name": "stresser",
+    "listen": "0.0.0.0:8666",
+    "upstream": "stresser-app:8080",
+    "enabled": true
+  }
+]
