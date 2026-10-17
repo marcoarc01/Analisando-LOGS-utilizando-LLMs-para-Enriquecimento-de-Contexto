@@ -19,7 +19,7 @@ from pathlib import Path
 
 import exporter
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 REPO = Path(__file__).resolve().parents[1]
 DATA_ROOT = Path(r"C:\tcc-data")
 MODE_DIRS = {"official": "official", "test": "test-runs"}
@@ -60,29 +60,31 @@ class Condition:
     name: str
     stress_level: int
     toxic_latency_ms: int | None
+    toxic_jitter_ms: int | None
     k6_scenario: str
 
     def toxic(self):
         if self.toxic_latency_ms is None:
             return None
         return {"name": TOXIC_NAME, "type": "latency", "stream": "downstream", "toxicity": 1.0,
-                "attributes": {"latency": self.toxic_latency_ms, "jitter": 0}}
+                "attributes": {"latency": self.toxic_latency_ms, "jitter": self.toxic_jitter_ms}}
 
     def params(self):
         return {"stress_level": self.stress_level, "toxic": self.toxic(), "k6_scenario": self.k6_scenario}
 
 
 CONDITIONS = {c.name: c for c in (
-    Condition("baseline", 0, None, "baseline"),
-    Condition("cpu30", 30, None, "stress_cpu"),
-    Condition("cpu50", 50, None, "stress_cpu"),
-    Condition("cpu80", 80, None, "stress_cpu"),
-    Condition("net_latency500", 0, 500, "network_latency"),
-    Condition("net_timeout2500", 0, 2500, "network_timeout"),
-    Condition("cpu30_lat500", 30, 500, "combined"),
-    Condition("cpu50_lat500", 50, 500, "combined"),
-    Condition("cpu80_lat500", 80, 500, "combined"),
+    Condition("baseline", 0, None, None, "baseline"),
+    Condition("cpu75", 75, None, None, "stress_cpu"),
+    Condition("cpu80", 80, None, None, "stress_cpu"),
+    Condition("cpu92", 92, None, None, "stress_cpu"),
+    Condition("net_latency500", 0, 500, 75, "network_latency"),
+    Condition("net_timeout2500", 0, 2500, 375, "network_timeout"),
+    Condition("cpu75_lat500", 75, 500, 75, "combined"),
+    Condition("cpu80_lat500", 80, 500, 75, "combined"),
+    Condition("cpu92_lat500", 92, 500, 75, "combined"),
 )}
+OFFICIAL_REPETITIONS = {name: 15 if name == "baseline" else 5 for name in CONDITIONS}
 
 
 def derive_seed(condition, repetition):
@@ -116,13 +118,65 @@ def run_paths(base, run_id):
             "manifest": base / "control" / "manifest.sha256"}
 
 
-def batch_plan(conditions, repetitions, batch_seed):
-    plan = [(c, r) for c in conditions for r in repetitions]
+def shuffled(plan, seed):
+    plan = list(plan)
     for c, r in plan:
         if c not in CONDITIONS or r < 1:
             raise ValueError(f"invalid plan item {c}/{r}")
-    random.Random(batch_seed).shuffle(plan)
+    random.Random(seed).shuffle(plan)
     return plan
+
+
+def batch_plan(conditions, repetitions, batch_seed):
+    return shuffled([(c, r) for c in conditions for r in repetitions], batch_seed)
+
+
+def official_plan(plan_seed):
+    return shuffled([(c, r) for c, n in OFFICIAL_REPETITIONS.items() for r in range(1, n + 1)], plan_seed)
+
+
+def check_official_items(plan):
+    outside = [f"{c}#{r}" for c, r in plan if c in OFFICIAL_REPETITIONS and r > OFFICIAL_REPETITIONS[c]]
+    if outside:
+        raise ValueError(f"official mode only accepts items of the official plan; outside: {outside}")
+
+
+def split_blocks(items, count):
+    if not 1 <= count <= len(items):
+        raise ValueError(f"block count must be between 1 and {len(items)}")
+    size, extra = divmod(len(items), count)
+    blocks, start = [], 0
+    for index in range(count):
+        end = start + size + (index < extra)
+        blocks.append(items[start:end])
+        start = end
+    return blocks
+
+
+def parse_block(text):
+    k, sep, n = text.partition("/")
+    if not (sep and k.isdigit() and n.isdigit() and 1 <= int(k) <= int(n)):
+        raise argparse.ArgumentTypeError("expected K/N with 1 <= K <= N")
+    return int(k), int(n)
+
+
+def completed_items(base, mode, phases_seconds):
+    path = base / "control" / "runs.csv"
+    if not path.exists():
+        return {}
+    done = {}
+    with open(path, encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            if row["status"] != "valid" or row["mode"] != mode or row["condition"] not in CONDITIONS:
+                continue
+            try:
+                record = json.loads((base / "control" / f"{row['experiment_run_id']}-phases.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (record.get("condition_params") == CONDITIONS[row["condition"]].params()
+                    and record.get("phases_seconds") == list(phases_seconds)):
+                done.setdefault((row["condition"], int(row["repetition"])), row["experiment_run_id"])
+    return done
 
 
 def check_git(mode, state):
@@ -565,19 +619,44 @@ def describe_plan(plan, mode, phases, batch_seed=None):
              f"k6={schedule['k6_duration']} batch_seed={batch_seed}"]
     for position, (name, rep) in enumerate(plan, 1):
         c = CONDITIONS[name]
-        toxic = f"latency {c.toxic_latency_ms} ms downstream" if c.toxic_latency_ms else "none"
-        lines.append(f"{position:>3}. {name:<16} rep={rep} seed={derive_seed(name, rep):<10} k6_tag={c.k6_scenario:<15} "
-                     f"stress={c.stress_level:<3} toxic={toxic:<28} apply=t0+{schedule['apply_offset_s']}s "
+        toxic = f"latency {c.toxic_latency_ms} jitter {c.toxic_jitter_ms} ms" if c.toxic_latency_ms else "none"
+        lines.append(f"{position:>3}. {name:<16} rep={rep:<2} seed={derive_seed(name, rep):<10} k6_tag={c.k6_scenario:<15} "
+                     f"stress={c.stress_level:<3} toxic={toxic:<27} apply=t0+{schedule['apply_offset_s']}s "
                      f"remove=t0+{schedule['remove_offset_s']}s")
-    per_run = schedule["k6_duration_s"] + INGESTION_WAIT_SECONDS + 45
-    lines.append(f"runs={len(plan)} estimated wall time ~{len(plan) * per_run / 60:.1f} min (incl. recreation/export)")
+    lines.append(f"runs={len(plan)} estimated wall time ~{len(plan) * run_minutes(schedule):.1f} min (incl. recreation/export)")
+    return "\n".join(lines)
+
+
+def run_minutes(schedule):
+    return (schedule["k6_duration_s"] + INGESTION_WAIT_SECONDS + 45) / 60
+
+
+def describe_blocks(blocks, selected, done, mode, phases):
+    minutes = run_minutes(phase_schedule(mode, phases))
+    lines = [f"blocks={len(blocks)}"]
+    for index, block in enumerate(blocks, 1):
+        counts = {}
+        for _, (name, _) in block:
+            counts[name] = counts.get(name, 0) + 1
+        composition = ", ".join(f"{name} x{counts[name]}" for name in CONDITIONS if name in counts)
+        mark = " <- selected" if index == selected else ""
+        lines.append(f"block {index}/{len(blocks)}: positions {block[0][0]}-{block[-1][0]} runs={len(block)} "
+                     f"~{len(block) * minutes:.1f} min | {composition}{mark}")
+        lines.append("    " + " ".join(f"{p}:{name}#{rep}" for p, (name, rep) in block))
+    pending = 0
+    for position, item in blocks[selected - 1]:
+        if item in done:
+            lines.append(f"skip position {position} {item[0]}#{item[1]}: already valid (run {done[item]})")
+        else:
+            pending += 1
+    lines.append(f"block {selected}/{len(blocks)}: to run={pending} skipped={len(blocks[selected - 1]) - pending}")
     return "\n".join(lines)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("run", "batch"):
+    for name in ("run", "batch", "plan"):
         p = sub.add_parser(name)
         p.add_argument("--mode", choices=sorted(MODE_DIRS), required=True)
         p.add_argument("--phases", type=int, nargs=3, metavar=("NORMAL1", "INTERVENTION", "NORMAL2"))
@@ -587,38 +666,58 @@ def main(argv=None):
     sub.choices["batch"].add_argument("--conditions", nargs="+", required=True, help="names or 'all'")
     sub.choices["batch"].add_argument("--repetitions", type=int, nargs="+", required=True)
     sub.choices["batch"].add_argument("--batch-seed", type=int, required=True)
+    sub.choices["plan"].add_argument("--plan-seed", type=int, required=True)
+    sub.choices["plan"].add_argument("--block", type=parse_block, required=True, metavar="K/N")
     args = parser.parse_args(argv)
 
     try:
         if args.command == "run":
             plan, batch_seed = [(args.condition, args.repetition)], None
-        else:
+        elif args.command == "batch":
             names = sorted(CONDITIONS) if args.conditions == ["all"] else args.conditions
             plan, batch_seed = batch_plan(names, args.repetitions, args.batch_seed), args.batch_seed
+        else:
+            plan, batch_seed = official_plan(args.plan_seed), args.plan_seed
+        if args.mode == "official":
+            check_official_items(plan)
         print(describe_plan(plan, args.mode, args.phases, batch_seed))
+        queue = list(enumerate(plan, 1))
+        if args.command == "plan":
+            selected, count = args.block
+            blocks = split_blocks(queue, count)
+            schedule = phase_schedule(args.mode, args.phases)
+            done = completed_items(DATA_ROOT / MODE_DIRS[args.mode], args.mode, schedule["phases_seconds"])
+            print(describe_blocks(blocks, selected, done, args.mode, args.phases))
+            queue = [(position, item) for position, item in blocks[selected - 1] if item not in done]
     except ValueError as error:
         parser.error(str(error))
     if args.dry_run:
         print("dry-run: nothing executed")
         return 0
+    if not queue:
+        print("nothing to run: every item of the block already has a valid run")
+        return 0
 
-    batch_id = str(uuid.uuid4()) if args.command == "batch" else None
-    for position, (name, rep) in enumerate(plan, 1):
+    batch_id = str(uuid.uuid4()) if args.command != "run" else None
+    for index, (position, (name, rep)) in enumerate(queue, 1):
         batch = {"id": batch_id, "seed": batch_seed, "position": position, "total": len(plan),
                  "order": [f"{c}#{r}" for c, r in plan]} if batch_id else None
+        if args.command == "plan":
+            batch.update(plan="official", block=f"{selected}/{count}")
+        label = f"{index}/{len(queue)} (position {position})"
         try:
             record = run_one(name, rep, args.mode, args.phases, batch)
         except PrecheckError as error:
-            print(f"ABORT before run {position}/{len(plan)}: {error}", file=sys.stderr)
+            print(f"ABORT before run {label}: {error}", file=sys.stderr)
             return 2
         except InfraError as error:
-            print(f"STOP at run {position}/{len(plan)} (infrastructure): {error}", file=sys.stderr)
+            print(f"STOP at run {label} (infrastructure): {error}", file=sys.stderr)
             return 1
         except KeyboardInterrupt:
             print("interrupted; cleanup done", file=sys.stderr)
             return 130
         if record["validity"]["status"] != "valid":
-            print(f"STOP at run {position}/{len(plan)}: run invalid {record['validity']['reasons']}", file=sys.stderr)
+            print(f"STOP at run {label}: run invalid {record['validity']['reasons']}", file=sys.stderr)
             return 1
     return 0
 

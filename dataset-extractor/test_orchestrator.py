@@ -1,10 +1,13 @@
+import contextlib
 import csv
+import io
 import json
 import tempfile
 import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import exporter
 import orchestrator as o
@@ -16,31 +19,39 @@ K6_TAGS = {"baseline", "stress_cpu", "recovery", "network_latency", "network_tim
 class CatalogTest(unittest.TestCase):
     def test_fixed_catalog(self):
         expected = {
-            "baseline": (0, None, "baseline"), "cpu30": (30, None, "stress_cpu"),
-            "cpu50": (50, None, "stress_cpu"), "cpu80": (80, None, "stress_cpu"),
-            "net_latency500": (0, 500, "network_latency"), "net_timeout2500": (0, 2500, "network_timeout"),
-            "cpu30_lat500": (30, 500, "combined"), "cpu50_lat500": (50, 500, "combined"),
-            "cpu80_lat500": (80, 500, "combined"),
+            "baseline": (0, None, None, "baseline"), "cpu75": (75, None, None, "stress_cpu"),
+            "cpu80": (80, None, None, "stress_cpu"), "cpu92": (92, None, None, "stress_cpu"),
+            "net_latency500": (0, 500, 75, "network_latency"), "net_timeout2500": (0, 2500, 375, "network_timeout"),
+            "cpu75_lat500": (75, 500, 75, "combined"), "cpu80_lat500": (80, 500, 75, "combined"),
+            "cpu92_lat500": (92, 500, 75, "combined"),
         }
-        self.assertEqual({n: (c.stress_level, c.toxic_latency_ms, c.k6_scenario) for n, c in o.CONDITIONS.items()}, expected)
+        self.assertEqual({n: (c.stress_level, c.toxic_latency_ms, c.toxic_jitter_ms, c.k6_scenario)
+                          for n, c in o.CONDITIONS.items()}, expected)
         self.assertTrue({c.k6_scenario for c in o.CONDITIONS.values()} <= K6_TAGS)
+        for removed in ("cpu30", "cpu50", "cpu30_lat500", "cpu50_lat500"):
+            self.assertNotIn(removed, o.CONDITIONS)
 
     def test_toxic_definition(self):
-        self.assertIsNone(o.CONDITIONS["cpu50"].toxic())
+        for name in ("baseline", "cpu75", "cpu80", "cpu92"):
+            self.assertIsNone(o.CONDITIONS[name].toxic())
         self.assertEqual(o.CONDITIONS["net_timeout2500"].toxic(), {
             "name": "intervention", "type": "latency", "stream": "downstream", "toxicity": 1.0,
-            "attributes": {"latency": 2500, "jitter": 0}})
+            "attributes": {"latency": 2500, "jitter": 375}})
+        for name in ("net_latency500", "cpu75_lat500", "cpu80_lat500", "cpu92_lat500"):
+            self.assertEqual(o.CONDITIONS[name].toxic()["attributes"], {"latency": 500, "jitter": 75})
+            self.assertEqual(o.CONDITIONS[name].toxic()["toxicity"], 1.0)
 
 
 class SeedTest(unittest.TestCase):
     def test_deterministic_and_distinct(self):
-        seeds = {(c, r): o.derive_seed(c, r) for c in o.CONDITIONS for r in range(1, 11)}
-        self.assertEqual(seeds, {(c, r): o.derive_seed(c, r) for c in o.CONDITIONS for r in range(1, 11)})
+        seeds = {(c, r): o.derive_seed(c, r) for c in o.CONDITIONS for r in range(1, 16)}
+        self.assertEqual(seeds, {(c, r): o.derive_seed(c, r) for c in o.CONDITIONS for r in range(1, 16)})
         self.assertEqual(len(set(seeds.values())), len(seeds))
         self.assertTrue(all(1 <= s < 2**31 for s in seeds.values()))
+        self.assertEqual(len({o.derive_seed(c, r) for c, r in o.official_plan(1)}), 55)
 
     def test_rejects_unknown(self):
-        for args in (("free-input", 1), ("cpu50", 0)):
+        for args in (("free-input", 1), ("cpu50", 1), ("cpu75", 0)):
             with self.assertRaises(ValueError):
                 o.derive_seed(*args)
 
@@ -82,9 +93,9 @@ class NamesTest(unittest.TestCase):
 
 def sample_record(status="valid"):
     return {
-        "orchestrator_version": o.VERSION, "experiment_run_id": RUN_ID, "condition": "cpu50_lat500",
-        "condition_params": o.CONDITIONS["cpu50_lat500"].params(), "repetition": 1, "mode": "test",
-        "seed": o.derive_seed("cpu50_lat500", 1), "git": {"commit": "a" * 40, "dirty": True, "porcelain": [" M x"]},
+        "orchestrator_version": o.VERSION, "experiment_run_id": RUN_ID, "condition": "cpu80_lat500",
+        "condition_params": o.CONDITIONS["cpu80_lat500"].params(), "repetition": 1, "mode": "test",
+        "seed": o.derive_seed("cpu80_lat500", 1), "git": {"commit": "a" * 40, "dirty": True, "porcelain": [" M x"]},
         "batch": None, "phases_seconds": [30, 30, 30], "k6_duration": "90s",
         "schedule": {"t0_utc": "2026-10-15T00:00:00.000000000Z"},
         "phase_boundaries_utc": {"intervention_start": "a", "intervention_end": "b"},
@@ -263,6 +274,119 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(sorted(a), sorted((c, r) for c in names for r in (1, 2)))
         with self.assertRaises(ValueError):
             o.batch_plan(["free-input"], [1], 7)
+
+
+class OfficialPlanTest(unittest.TestCase):
+    def test_items_and_counts(self):
+        plan = o.official_plan(202610160)
+        self.assertEqual(len(plan), 55)
+        self.assertEqual(len(set(plan)), 55)
+        expected = {("baseline", r) for r in range(1, 16)} | {
+            (c, r) for c in o.CONDITIONS if c != "baseline" for r in range(1, 6)}
+        self.assertEqual(set(plan), expected)
+        counts = {c: sum(1 for name, _ in plan if name == c) for c in o.CONDITIONS}
+        self.assertEqual(counts, {c: 15 if c == "baseline" else 5 for c in o.CONDITIONS})
+
+    def test_deterministic_shuffle(self):
+        self.assertEqual(o.official_plan(5), o.official_plan(5))
+        self.assertNotEqual(o.official_plan(5), o.official_plan(6))
+
+    def test_official_items_only(self):
+        o.check_official_items(o.official_plan(1))
+        for item in (("baseline", 16), ("cpu75", 6)):
+            with self.assertRaises(ValueError):
+                o.check_official_items([item])
+
+    def test_blocks(self):
+        plan = list(enumerate(o.official_plan(1), 1))
+        blocks = o.split_blocks(plan, 5)
+        self.assertEqual([len(b) for b in blocks], [11] * 5)
+        self.assertEqual([item for block in blocks for item in block], plan)
+        self.assertEqual([len(b) for b in o.split_blocks(plan, 4)], [14, 14, 14, 13])
+        for count in (0, 56):
+            with self.assertRaises(ValueError):
+                o.split_blocks(plan, count)
+
+    def test_parse_block(self):
+        self.assertEqual(o.parse_block("2/5"), (2, 5))
+        for text in ("0/5", "6/5", "5", "a/5", "1/"):
+            with self.assertRaises(o.argparse.ArgumentTypeError):
+                o.parse_block(text)
+
+
+class ResumeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.base = self.root / o.MODE_DIRS["official"]
+        self.plan = o.official_plan(202610160)
+        self.block = o.split_blocks(list(enumerate(self.plan, 1)), 5)[0]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def add_run(self, condition, repetition, status="valid", mode="official", params=None, phases=(120, 120, 120)):
+        run_id = str(uuid.uuid4())
+        record = sample_record(status)
+        record.update(experiment_run_id=run_id, condition=condition, repetition=repetition, mode=mode,
+                      condition_params=params or o.CONDITIONS[condition].params(), phases_seconds=list(phases))
+        o.write_new(self.base / "control" / f"{run_id}-phases.json", o.phases_bytes(record))
+        o.append_runs_row(self.base / "control" / "runs.csv", o.runs_row(record))
+        return run_id
+
+    def test_completed_items_requires_valid_matching_run(self):
+        items = [item for _, item in self.block]
+        done_id = self.add_run(*items[0])
+        self.add_run(*items[1], status="invalid")
+        self.add_run(*items[2], mode="test")
+        self.add_run(*items[3], phases=(30, 30, 30))
+        old = {**o.CONDITIONS[items[4][0]].params(), "stress_level": 50}
+        self.add_run(*items[4], params=old)
+        self.assertEqual(o.completed_items(self.base, "official", [120, 120, 120]), {items[0]: done_id})
+        self.assertEqual(o.completed_items(self.root / "missing", "official", [120, 120, 120]), {})
+
+    def main(self, *extra, run_one=None):
+        out = io.StringIO()
+        with mock.patch.object(o, "DATA_ROOT", self.root), mock.patch.object(o, "run_one", run_one), \
+                contextlib.redirect_stdout(out):
+            code = o.main(["plan", "--mode", "official", "--plan-seed", "202610160", "--block", "1/5", *extra])
+        return code, out.getvalue()
+
+    def test_dry_run_shows_plan_blocks_and_skips(self):
+        skipped = self.block[1]
+        run_id = self.add_run(*skipped[1])
+        code, text = self.main("--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("runs=55", text)
+        self.assertEqual(sum(line.startswith("block ") and "positions" in line for line in text.splitlines()), 5)
+        self.assertIn(f"skip position {skipped[0]} {skipped[1][0]}#{skipped[1][1]}: already valid (run {run_id})", text)
+        self.assertIn("block 1/5: to run=10 skipped=1", text)
+        self.assertIn("dry-run: nothing executed", text)
+
+    def test_resume_runs_only_pending_items(self):
+        self.add_run(*self.block[0][1])
+        self.add_run(*self.block[5][1])
+        calls = []
+
+        def run_one(name, rep, mode, phases, batch):
+            calls.append(((name, rep), batch))
+            return {"validity": {"status": "valid", "reasons": []}}
+
+        code, _ = self.main(run_one=run_one)
+        self.assertEqual(code, 0)
+        expected = [item for i, (_, item) in enumerate(self.block) if i not in (0, 5)]
+        self.assertEqual([item for item, _ in calls], expected)
+        positions = [p for i, (p, _) in enumerate(self.block) if i not in (0, 5)]
+        self.assertEqual([b["position"] for _, b in calls], positions)
+        self.assertTrue(all(b["block"] == "1/5" and b["total"] == 55 and b["seed"] == 202610160 for _, b in calls))
+        self.assertEqual(len({b["id"] for _, b in calls}), 1)
+
+    def test_block_already_complete(self):
+        for _, item in self.block:
+            self.add_run(*item)
+        code, text = self.main(run_one=lambda *a: self.fail("nothing should run"))
+        self.assertEqual(code, 0)
+        self.assertIn("nothing to run", text)
 
 
 if __name__ == "__main__":
