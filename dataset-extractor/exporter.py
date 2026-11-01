@@ -15,6 +15,7 @@ LIMIT = 5000
 MARGIN_BEFORE_SECONDS = 10
 MARGIN_AFTER_SECONDS = 15
 CLIENT_ERROR_STATUSES = (404, 422)
+GO_LOOKUP_EVENTS = ("state_queried", "state_request_canceled")
 
 
 class ExportError(Exception):
@@ -118,20 +119,21 @@ def final_events(rows):
 
 
 def correlation(rows):
+    """Each FastAPI lookup must have exactly one Go record of it: state_queried, or state_request_canceled when
+    the FastAPI gave up first (real timeouts); 503 answers are expected outcomes, not integrity errors."""
     finals = [e for _, e in final_events(rows)]
     lookups = collections.Counter(
         e.get("request_id") for e in finals if e.get("status_code") not in CLIENT_ERROR_STATUSES
     )
     client_errors = {e.get("request_id") for e in finals if e.get("status_code") in CLIENT_ERROR_STATUSES}
-    go = collections.Counter(
-        e.get("request_id") for _, _, e in rows
-        if e["service"] == "stresser-app" and e.get("event") == "state_queried"
-    )
+    go_events = [e for _, _, e in rows if e["service"] == "stresser-app" and e.get("event") in GO_LOOKUP_EVENTS]
+    go = collections.Counter(e.get("request_id") for e in go_events)
     return {
         "fastapi_final_events": len(finals),
         "lookup_requests": sum(lookups.values()),
         "client_error_requests": len(finals) - sum(lookups.values()),
-        "go_state_queried": sum(go.values()),
+        "go_state_queried": sum(e.get("event") == "state_queried" for e in go_events),
+        "go_state_request_canceled": sum(e.get("event") == "state_request_canceled" for e in go_events),
         "both": len(set(lookups) & set(go)),
         "only_fastapi": len(set(lookups) - set(go)),
         "only_go": len(set(go) - set(lookups)),

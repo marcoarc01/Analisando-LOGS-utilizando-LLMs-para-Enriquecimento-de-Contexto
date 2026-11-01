@@ -32,6 +32,9 @@ def main():
         ],
         required=True,
     )
+    parser.add_argument(
+        "--seed", type=int, help="jitter seed (default: K6_SEED, else derived from testid)"
+    )
     args = parser.parse_args()
     if not re.fullmatch(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",
@@ -57,6 +60,9 @@ def main():
         **os.environ,
         "K6_EXPERIMENT_RUN_ID": args.testid,
         "K6_SCENARIO": args.scenario,
+        "K6_SEED": str(args.seed)
+        if args.seed is not None
+        else os.environ.get("K6_SEED") or str(int(args.testid[:8], 16)),
     }
     try:
         result = docker(

@@ -14,32 +14,48 @@ import orchestrator as o
 
 RUN_ID = "3f1c2e0a-7b6d-4c5e-9f8a-1b2c3d4e5f60"
 K6_TAGS = {"baseline", "stress_cpu", "recovery", "network_latency", "network_timeout", "combined"}
+TIMEOUT_MS = 303
 
 
 class CatalogTest(unittest.TestCase):
     def test_fixed_catalog(self):
         expected = {
-            "baseline": (0, None, None, "baseline"), "cpu75": (75, None, None, "stress_cpu"),
-            "cpu80": (80, None, None, "stress_cpu"), "cpu92": (92, None, None, "stress_cpu"),
-            "net_latency500": (0, 500, 75, "network_latency"), "net_timeout2500": (0, 2500, 375, "network_timeout"),
-            "cpu75_lat500": (75, 500, 75, "combined"), "cpu80_lat500": (80, 500, 75, "combined"),
-            "cpu92_lat500": (92, 500, 75, "combined"),
+            "baseline": (0, None, "baseline"), "cpu75": (75, None, "stress_cpu"),
+            "cpu80": (80, None, "stress_cpu"), "cpu92": (92, None, "stress_cpu"),
+            "net_slow": (0, 0.25, "network_latency"), "net_timeout": (0, 1.25, "network_timeout"),
+            "cpu75_net_slow": (75, 0.25, "combined"), "cpu80_net_slow": (80, 0.25, "combined"),
+            "cpu92_net_slow": (92, 0.25, "combined"),
         }
-        self.assertEqual({n: (c.stress_level, c.toxic_latency_ms, c.toxic_jitter_ms, c.k6_scenario)
+        self.assertEqual({n: (c.stress_level, c.toxic_timeout_factor, c.k6_scenario)
                           for n, c in o.CONDITIONS.items()}, expected)
         self.assertTrue({c.k6_scenario for c in o.CONDITIONS.values()} <= K6_TAGS)
-        for removed in ("cpu30", "cpu50", "cpu30_lat500", "cpu50_lat500"):
+        for removed in ("cpu30", "cpu50", "net_latency500", "net_timeout2500", "cpu75_lat500"):
             self.assertNotIn(removed, o.CONDITIONS)
+        for name in o.CONDITIONS:
+            self.assertFalse(any(ch.isdigit() for ch in name.replace("cpu75", "").replace("cpu80", "")
+                                 .replace("cpu92", "")), name)
 
-    def test_toxic_definition(self):
+    def test_toxic_definition_follows_the_timeout(self):
         for name in ("baseline", "cpu75", "cpu80", "cpu92"):
-            self.assertIsNone(o.CONDITIONS[name].toxic())
-        self.assertEqual(o.CONDITIONS["net_timeout2500"].toxic(), {
+            self.assertIsNone(o.CONDITIONS[name].toxic(TIMEOUT_MS))
+            self.assertFalse(o.CONDITIONS[name].has_toxic)
+        self.assertEqual(o.CONDITIONS["net_timeout"].toxic(TIMEOUT_MS), {
             "name": "intervention", "type": "latency", "stream": "downstream", "toxicity": 1.0,
-            "attributes": {"latency": 2500, "jitter": 375}})
-        for name in ("net_latency500", "cpu75_lat500", "cpu80_lat500", "cpu92_lat500"):
-            self.assertEqual(o.CONDITIONS[name].toxic()["attributes"], {"latency": 500, "jitter": 75})
-            self.assertEqual(o.CONDITIONS[name].toxic()["toxicity"], 1.0)
+            "attributes": {"latency": 379, "jitter": 57}})
+        for name in ("net_slow", "cpu75_net_slow", "cpu80_net_slow", "cpu92_net_slow"):
+            self.assertEqual(o.CONDITIONS[name].toxic(TIMEOUT_MS)["attributes"], {"latency": 76, "jitter": 11})
+        # The v1 values come back with the v1 timeout of 2 s.
+        self.assertEqual(o.CONDITIONS["net_slow"].toxic_values(2000), (500, 75))
+        self.assertEqual(o.CONDITIONS["net_timeout"].toxic_values(2000), (2500, 375))
+        self.assertEqual(o.round_half_up(75.5), 76)
+        self.assertEqual(o.round_half_up(74.5), 75)
+        params = o.CONDITIONS["net_slow"].params(TIMEOUT_MS)
+        self.assertEqual((params["lookup_timeout_ms"], params["toxic_timeout_factor"]), (TIMEOUT_MS, 0.25))
+
+    def test_lookup_timeout_from_compose_config(self):
+        config = {"services": {"application-api": {"environment": {"STRESSER_TIMEOUT_SECONDS": "0.303"}}}}
+        runner = lambda args: SimpleNamespace(stdout=json.dumps(config))
+        self.assertEqual(o.lookup_timeout_ms(runner), 303)
 
 
 class SeedTest(unittest.TestCase):
@@ -54,22 +70,53 @@ class SeedTest(unittest.TestCase):
         for args in (("free-input", 1), ("cpu50", 1), ("cpu75", 0)):
             with self.assertRaises(ValueError):
                 o.derive_seed(*args)
+            with self.assertRaises(ValueError):
+                o.derive_k6_seed(*args)
+
+    def test_k6_seed_from_sha256_of_condition_and_repetition(self):
+        seeds = {(c, r): o.derive_k6_seed(c, r) for c in o.CONDITIONS for r in range(1, 16)}
+        self.assertEqual(len(set(seeds.values())), len(seeds))
+        self.assertTrue(all(0 <= s < 2**32 for s in seeds.values()))
+        digest = o.hashlib.sha256(b"tcc-k6-seed-v1:cpu80:3").hexdigest()
+        self.assertEqual(o.derive_k6_seed("cpu80", 3), int(digest[:8], 16))
 
 
 class ScheduleTest(unittest.TestCase):
     def test_test_mode(self):
         self.assertEqual(o.phase_schedule("test"), {
             "phases_seconds": [30, 30, 30], "apply_offset_s": 30, "remove_offset_s": 60,
-            "k6_duration": "90s", "k6_duration_s": 90})
+            "k6_duration": "90s", "k6_duration_s": 90, "start_offset": None})
         s = o.phase_schedule("test", [20, 40, 25])
         self.assertEqual((s["apply_offset_s"], s["remove_offset_s"], s["k6_duration"]), (20, 60, "85s"))
 
-    def test_official_mode_is_fixed(self):
-        s = o.phase_schedule("official")
-        self.assertEqual((s["apply_offset_s"], s["remove_offset_s"], s["k6_duration"]), (120, 240, "360s"))
-        self.assertEqual(o.phase_schedule("official", [120, 120, 120])["k6_duration_s"], 360)
+    def test_official_mode_derives_the_phases(self):
+        for condition in o.CONDITIONS:
+            for repetition in range(1, o.OFFICIAL_REPETITIONS[condition] + 1):
+                s = o.phase_schedule("official", None, condition, repetition)
+                start = s["start_offset"]["start_offset_s"]
+                self.assertEqual(s["phases_seconds"], [start, 120, 240 - start])
+                self.assertEqual((s["apply_offset_s"], s["remove_offset_s"], s["k6_duration"]),
+                                 (start, start + 120, "360s"))
+                self.assertTrue(60 <= start <= 180)
         with self.assertRaises(ValueError):
-            o.phase_schedule("official", [30, 30, 30])
+            o.phase_schedule("official", [120, 120, 120], "cpu75", 1)
+        with self.assertRaises(ValueError):
+            o.phase_schedule("official", None, "cpu75", 6)
+        self.assertIsNone(o.phase_schedule("test")["start_offset"])
+
+    def test_start_offsets_are_stratified(self):
+        for condition, strata in o.OFFICIAL_REPETITIONS.items():
+            offsets = [o.start_offset(condition, r) for r in range(1, strata + 1)]
+            self.assertEqual(sorted(x["stratum"] for x in offsets), list(range(1, strata + 1)))
+            width = 120 / strata
+            for x in offsets:
+                lo, hi = 60 + (x["stratum"] - 1) * width, 60 + x["stratum"] * width
+                self.assertTrue(lo <= x["start_offset_s"] < hi or (x["stratum"] == strata and x["start_offset_s"] == 180))
+                self.assertEqual(x["stratum_seconds"][0], o.math.ceil(lo))
+            self.assertEqual(offsets, [o.start_offset(condition, r) for r in range(1, strata + 1)])
+        order = [o.start_offset("cpu75", r)["stratum"] for r in range(1, 6)]
+        self.assertNotEqual(order, [o.start_offset("cpu80", r)["stratum"] for r in range(1, 6)])
+        self.assertEqual(o.start_offset("baseline", 15)["strata"], 15)
 
     def test_invalid_phases(self):
         for phases in ([0, 30, 30], [30, 30], [30, -1, 30]):
@@ -94,9 +141,9 @@ class NamesTest(unittest.TestCase):
 def sample_record(status="valid"):
     return {
         "orchestrator_version": o.VERSION, "experiment_run_id": RUN_ID, "condition": "cpu80_lat500",
-        "condition_params": o.CONDITIONS["cpu80_lat500"].params(), "repetition": 1, "mode": "test",
-        "seed": o.derive_seed("cpu80_lat500", 1), "git": {"commit": "a" * 40, "dirty": True, "porcelain": [" M x"]},
-        "batch": None, "phases_seconds": [30, 30, 30], "k6_duration": "90s",
+        "condition_params": o.CONDITIONS["cpu80_net_slow"].params(TIMEOUT_MS), "repetition": 1, "mode": "test",
+        "seed": o.derive_seed("cpu80_net_slow", 1), "git": {"commit": "a" * 40, "dirty": True, "porcelain": [" M x"]},
+        "batch": None, "phases_seconds": [30, 30, 30], "k6_duration": "90s", "k6_seed": 1, "start_offset": None,
         "schedule": {"t0_utc": "2026-10-15T00:00:00.000000000Z"},
         "phase_boundaries_utc": {"intervention_start": "a", "intervention_end": "b"},
         "k6": {"exit_code": 0, "end_utc": "c", "status0": 0, "summary": {"http_reqs": 10, "dropped_iterations": 0}},
@@ -254,6 +301,32 @@ class ExporterTest(unittest.TestCase):
         rows, _ = exporter.collect(RUN_ID, 0, exporter.NS, query=lambda s, lo, hi, l: [["0", x] for x in lines] if lo < 0 else [])
         self.assertFalse(exporter.correlation(rows)["one_to_one"])
 
+    def rows(self, lines):
+        rows, _ = exporter.collect(RUN_ID, 0, exporter.NS, query=lambda s, lo, hi, l: [["0", x] for x in lines] if lo < 0 else [])
+        return rows
+
+    def test_go_cancel_counts_as_the_lookup_record(self):
+        lines = [l for l in self.lines() if '"r2"' not in l or "application-api" in l]
+        lines.append(event("2026-10-15T00:00:01.500Z", "stresser-app", "r2", event="state_request_canceled",
+                           error="context canceled"))
+        corr = exporter.correlation(self.rows(lines))
+        self.assertTrue(corr["one_to_one"])
+        self.assertEqual((corr["go_state_queried"], corr["go_state_request_canceled"]), (1, 1))
+
+    def test_lookup_without_any_go_record_or_with_two_breaks_correlation(self):
+        missing = [l for l in self.lines() if not ('"r2"' in l and "stresser-app" in l)]
+        self.assertFalse(exporter.correlation(self.rows(missing))["one_to_one"])
+        twice = self.lines() + [event("2026-10-15T00:00:01.600Z", "stresser-app", "r2", event="state_request_canceled",
+                                      error="context canceled")]
+        self.assertFalse(exporter.correlation(self.rows(twice))["one_to_one"])
+
+    def test_new_intermediate_events_are_not_final_events(self):
+        lines = self.lines() + [event("2026-10-15T00:00:02.5Z", "application-api", "r1", event=name)
+                                for name in ("dependency_request_sent", "dependency_response_received")]
+        corr = exporter.correlation(self.rows(lines))
+        self.assertEqual(corr["fastapi_final_events"], 4)
+        self.assertTrue(corr["one_to_one"])
+
     def test_phase_metrics_by_arrival(self):
         rows, _ = exporter.collect(RUN_ID, 0, exporter.NS, query=lambda s, lo, hi, l: [["0", x] for x in self.lines()] if lo < 0 else [])
         t = exporter.ns("2026-10-15T00:00:01Z")
@@ -325,11 +398,12 @@ class ResumeTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def add_run(self, condition, repetition, status="valid", mode="official", params=None, phases=(120, 120, 120)):
+    def add_run(self, condition, repetition, status="valid", mode="official", params=None, phases=None):
         run_id = str(uuid.uuid4())
         record = sample_record(status)
+        phases = phases or o.phase_schedule("official", None, condition, repetition)["phases_seconds"]
         record.update(experiment_run_id=run_id, condition=condition, repetition=repetition, mode=mode,
-                      condition_params=params or o.CONDITIONS[condition].params(), phases_seconds=list(phases))
+                      condition_params=params or o.CONDITIONS[condition].params(TIMEOUT_MS), phases_seconds=list(phases))
         o.write_new(self.base / "control" / f"{run_id}-phases.json", o.phases_bytes(record))
         o.append_runs_row(self.base / "control" / "runs.csv", o.runs_row(record))
         return run_id
@@ -339,16 +413,26 @@ class ResumeTest(unittest.TestCase):
         done_id = self.add_run(*items[0])
         self.add_run(*items[1], status="invalid")
         self.add_run(*items[2], mode="test")
-        self.add_run(*items[3], phases=(30, 30, 30))
-        old = {**o.CONDITIONS[items[4][0]].params(), "stress_level": 50}
+        self.add_run(*items[3], phases=(120, 120, 120))
+        old = {**o.CONDITIONS[items[4][0]].params(TIMEOUT_MS), "stress_level": 50}
         self.add_run(*items[4], params=old)
-        self.assertEqual(o.completed_items(self.base, "official", [120, 120, 120]), {items[0]: done_id})
-        self.assertEqual(o.completed_items(self.root / "missing", "official", [120, 120, 120]), {})
+        self.add_run(*items[5], params=o.CONDITIONS[items[5][0]].params(2000))
+        self.assertEqual(o.completed_items(self.base, "official", TIMEOUT_MS), {items[0]: done_id})
+        self.assertEqual(o.completed_items(self.root / "missing", "official", TIMEOUT_MS), {})
+
+    def test_v1_runs_never_count_as_done(self):
+        run_id = str(uuid.uuid4())
+        record = sample_record()
+        record.update(experiment_run_id=run_id, condition="net_latency500", repetition=1, mode="official",
+                      phases_seconds=[120, 120, 120])
+        o.write_new(self.base / "control" / f"{run_id}-phases.json", o.phases_bytes(record))
+        o.append_runs_row(self.base / "control" / "runs.csv", o.runs_row(record))
+        self.assertEqual(o.completed_items(self.base, "official", TIMEOUT_MS), {})
 
     def main(self, *extra, run_one=None):
         out = io.StringIO()
         with mock.patch.object(o, "DATA_ROOT", self.root), mock.patch.object(o, "run_one", run_one), \
-                contextlib.redirect_stdout(out):
+                mock.patch.object(o, "lookup_timeout_ms", lambda: TIMEOUT_MS), contextlib.redirect_stdout(out):
             code = o.main(["plan", "--mode", "official", "--plan-seed", "202610160", "--block", "1/5", *extra])
         return code, out.getvalue()
 
@@ -362,13 +446,20 @@ class ResumeTest(unittest.TestCase):
         self.assertIn(f"skip position {skipped[0]} {skipped[1][0]}#{skipped[1][1]}: already valid (run {run_id})", text)
         self.assertIn("block 1/5: to run=10 skipped=1", text)
         self.assertIn("dry-run: nothing executed", text)
+        self.assertIn("lookup_timeout_ms=303", text)
+        first = self.block[0][1]
+        start = o.start_offset(*first)["start_offset_s"]
+        line = next(l for l in text.splitlines() if l.lstrip().startswith(f"{self.block[0][0]}. {first[0]} "))
+        self.assertIn(f"k6_seed={o.derive_k6_seed(*first)}", line)
+        self.assertIn(f"apply=t0+{start}s remove=t0+{start + 120}s", line)
 
     def test_resume_runs_only_pending_items(self):
         self.add_run(*self.block[0][1])
         self.add_run(*self.block[5][1])
         calls = []
 
-        def run_one(name, rep, mode, phases, batch):
+        def run_one(name, rep, mode, phases, batch, timeout_ms=None):
+            self.assertEqual(timeout_ms, TIMEOUT_MS)
             calls.append(((name, rep), batch))
             return {"validity": {"status": "valid", "reasons": []}}
 

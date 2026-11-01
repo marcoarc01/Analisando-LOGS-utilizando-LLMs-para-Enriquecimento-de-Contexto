@@ -13,6 +13,7 @@ application-api container, which docker-compose.yml never sets (for instance a t
 
 import argparse
 import collections
+import hashlib
 import json
 import math
 import sys
@@ -31,6 +32,16 @@ def nearest_rank(values, q):
     return values[max(0, math.ceil(q * len(values)) - 1)]
 
 
+def quantile_interval(values, q, z=1.96):
+    """Approximate 95% distribution-free interval of a quantile: the order statistics at ranks
+    n*q -/+ z*sqrt(n*q*(1-q)) (normal approximation of the binomial count below the quantile)."""
+    n = len(values)
+    spread = z * math.sqrt(n * q * (1 - q))
+    lo = max(1, math.floor(n * q - spread))
+    hi = min(n, math.ceil(n * q + spread))
+    return {"confidence": 0.95, "ranks": [lo, hi], "values_ms": [round(values[lo - 1], 3), round(values[hi - 1], 3)]}
+
+
 def env_of(container):
     return json.loads(p.docker("inspect", container))[0]["Config"]["Env"]
 
@@ -45,7 +56,8 @@ def lookup_timings(container, lo_ns, hi_ns):
     return {"method": "LOOKUP_TIMING_FILE: perf_counter_ns around the httpx GET /api/state, per call; "
                       "percentiles by nearest rank", "samples": len(durations),
             "outcomes": dict(collections.Counter(outcome for _, outcome in selected)),
-            **stats, "max": round(durations[-1], 3), "samples_above_p99_9": sum(d > stats["p99_9"] for d in durations)}
+            **stats, "max": round(durations[-1], 3), "samples_above_p99_9": sum(d > stats["p99_9"] for d in durations),
+            "p99_9_interval": quantile_interval(durations, 0.999)}
 
 
 def measure(name, duration, skip, tail, timing, expected, output):
@@ -61,7 +73,8 @@ def measure(name, duration, skip, tail, timing, expected, output):
     if timing and not any(v.startswith(TIMING_ENV) for v in env_of(ids["application-api"])):
         raise o.InfraError("--timing needs LOOKUP_TIMING_FILE in the application-api container")
     run_id = str(uuid.uuid4())
-    k6 = o.K6Process(run_id, "baseline", f"{duration}s")
+    k6_seed = int(hashlib.sha256(f"tcc-calibration-k6-seed-v1:{name}".encode()).hexdigest()[:8], 16)
+    k6 = o.K6Process(run_id, "baseline", f"{duration}s", k6_seed)
     started = time.monotonic()
     k6.start()
     o.sleep_until(started + skip)
@@ -80,7 +93,7 @@ def measure(name, duration, skip, tail, timing, expected, output):
         cpu[service] = {"cpu_percent_of_1_cpu": round(100 * delta["usage_usec"] / wall_us, 2), **delta}
     errors = {k: n for k, n in (by_status or {}).items() if k.endswith("|0") or k.split("|")[1].startswith("5")}
     result = {
-        "name": name, "k6_testid": run_id, "k6_exit_code": exit_code, "duration_s": duration,
+        "name": name, "k6_testid": run_id, "k6_seed": k6_seed, "k6_exit_code": exit_code, "duration_s": duration,
         "window": {"start_utc": o.utc_iso(first["utc_ns"]), "end_utc": o.utc_iso(last["utc_ns"]),
                    "seconds": round(wall_us / 1e6, 3)},
         "config": {s: sorted(v for v in env_of(c) if v.split("=", 1)[0] in (

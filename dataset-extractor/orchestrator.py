@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import io
 import json
+import math
 import os
 import random
 import signal
@@ -19,13 +20,32 @@ from pathlib import Path
 
 import exporter
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 REPO = Path(__file__).resolve().parents[1]
 DATA_ROOT = Path(r"C:\tcc-data")
 MODE_DIRS = {"official": "official", "test": "test-runs"}
-OFFICIAL_PHASES = (120, 120, 120)
 TEST_DEFAULT_PHASES = (30, 30, 30)
 SEED_NAMESPACE = "tcc-experiment-seed-v1"
+K6_SEED_NAMESPACE = "tcc-k6-seed-v1"
+START_STRATA_NAMESPACE = "tcc-start-strata-v1"
+START_OFFSET_NAMESPACE = "tcc-start-offset-v1"
+START_RANGE_S = (60, 180)
+INTERVENTION_S = 120
+TOTAL_S = 360
+START_RULE = (
+    "official phases (s, 120, 240 - s), 360 s in total; for a condition with R official repetitions [60, 180] is "
+    "split into R equal strata (half-open, the last one closed); repetition r uses stratum order[r - 1], where "
+    "order = list(range(R)) shuffled by random.Random(int(sha256('tcc-start-strata-v1:<condition>')[:12], 16)); "
+    "s = random.Random(int(sha256('tcc-start-offset-v1:<condition>:<repetition>')[:12], 16)).randint over the "
+    "whole seconds of that stratum; baseline draws s too (scheduled times only, no fault)"
+)
+K6_SEED_RULE = "int(sha256('tcc-k6-seed-v1:<condition>:<repetition>')[:8], 16), passed to k6 as K6_SEED"
+TOXIC_JITTER_FRACTION = 0.15
+NETWORK_RULE = (
+    "latency = round_half_up(factor * lookup timeout in ms), jitter = round_half_up(0.15 * latency); factor 0.25 "
+    "(slow network) and 1.25 (network timeout) keep the v1 ratios to its 2 s timeout (500/2000 and 2500/2000); "
+    "the timeout is STRESSER_TIMEOUT_SECONDS from `docker compose config`"
+)
 SERVICES = frozenset({
     "application-api", "stresser-app", "toxiproxy", "prometheus", "grafana",
     "loki", "promtail", "tempo", "otel-collector",
@@ -55,50 +75,101 @@ class InfraError(Exception):
     pass
 
 
+def round_half_up(value):
+    return math.floor(value + 0.5)
+
+
 @dataclasses.dataclass(frozen=True)
 class Condition:
     name: str
     stress_level: int
-    toxic_latency_ms: int | None
-    toxic_jitter_ms: int | None
+    toxic_timeout_factor: float | None
     k6_scenario: str
 
-    def toxic(self):
-        if self.toxic_latency_ms is None:
+    @property
+    def has_toxic(self):
+        return self.toxic_timeout_factor is not None
+
+    def toxic_values(self, timeout_ms):
+        if not self.has_toxic:
             return None
+        latency = round_half_up(self.toxic_timeout_factor * timeout_ms)
+        return latency, round_half_up(TOXIC_JITTER_FRACTION * latency)
+
+    def toxic(self, timeout_ms):
+        if not self.has_toxic:
+            return None
+        latency, jitter = self.toxic_values(timeout_ms)
         return {"name": TOXIC_NAME, "type": "latency", "stream": "downstream", "toxicity": 1.0,
-                "attributes": {"latency": self.toxic_latency_ms, "jitter": self.toxic_jitter_ms}}
+                "attributes": {"latency": latency, "jitter": jitter}}
 
-    def params(self):
-        return {"stress_level": self.stress_level, "toxic": self.toxic(), "k6_scenario": self.k6_scenario}
+    def params(self, timeout_ms):
+        return {"stress_level": self.stress_level, "toxic": self.toxic(timeout_ms), "k6_scenario": self.k6_scenario,
+                "lookup_timeout_ms": timeout_ms, "toxic_timeout_factor": self.toxic_timeout_factor}
 
 
+# Names say which fault, never its size: the network values follow the lookup timeout (NETWORK_RULE).
 CONDITIONS = {c.name: c for c in (
-    Condition("baseline", 0, None, None, "baseline"),
-    Condition("cpu75", 75, None, None, "stress_cpu"),
-    Condition("cpu80", 80, None, None, "stress_cpu"),
-    Condition("cpu92", 92, None, None, "stress_cpu"),
-    Condition("net_latency500", 0, 500, 75, "network_latency"),
-    Condition("net_timeout2500", 0, 2500, 375, "network_timeout"),
-    Condition("cpu75_lat500", 75, 500, 75, "combined"),
-    Condition("cpu80_lat500", 80, 500, 75, "combined"),
-    Condition("cpu92_lat500", 92, 500, 75, "combined"),
+    Condition("baseline", 0, None, "baseline"),
+    Condition("cpu75", 75, None, "stress_cpu"),
+    Condition("cpu80", 80, None, "stress_cpu"),
+    Condition("cpu92", 92, None, "stress_cpu"),
+    Condition("net_slow", 0, 0.25, "network_latency"),
+    Condition("net_timeout", 0, 1.25, "network_timeout"),
+    Condition("cpu75_net_slow", 75, 0.25, "combined"),
+    Condition("cpu80_net_slow", 80, 0.25, "combined"),
+    Condition("cpu92_net_slow", 92, 0.25, "combined"),
 )}
 OFFICIAL_REPETITIONS = {name: 15 if name == "baseline" else 5 for name in CONDITIONS}
 
 
-def derive_seed(condition, repetition):
+def _check_item(condition, repetition):
     if condition not in CONDITIONS or repetition < 1:
         raise ValueError("unknown condition or repetition < 1")
-    digest = hashlib.sha256(f"{SEED_NAMESPACE}:{condition}:{repetition}".encode()).hexdigest()
-    return int(digest[:12], 16) % (2**31 - 1) + 1
 
 
-def phase_schedule(mode, phases=None):
+def _hash_int(text, digits):
+    return int(hashlib.sha256(text.encode()).hexdigest()[:digits], 16)
+
+
+def derive_seed(condition, repetition):
+    _check_item(condition, repetition)
+    return _hash_int(f"{SEED_NAMESPACE}:{condition}:{repetition}", 12) % (2**31 - 1) + 1
+
+
+def derive_k6_seed(condition, repetition):
+    _check_item(condition, repetition)
+    return _hash_int(f"{K6_SEED_NAMESPACE}:{condition}:{repetition}", 8)
+
+
+def start_offset(condition, repetition):
+    """Stratified fault start for an official item (START_RULE)."""
+    _check_item(condition, repetition)
+    strata = OFFICIAL_REPETITIONS[condition]
+    if repetition > strata:
+        raise ValueError(f"{condition} has {strata} official repetitions")
+    order = list(range(strata))
+    random.Random(_hash_int(f"{START_STRATA_NAMESPACE}:{condition}", 12)).shuffle(order)
+    index = order[repetition - 1]
+    lo, hi = START_RANGE_S
+    width = (hi - lo) / strata
+    lower, upper = lo + index * width, lo + (index + 1) * width
+    first = math.ceil(lower)
+    last = hi if index == strata - 1 else math.ceil(upper) - 1
+    seconds = random.Random(_hash_int(f"{START_OFFSET_NAMESPACE}:{condition}:{repetition}", 12)).randint(first, last)
+    return {"start_offset_s": seconds, "stratum": index + 1, "strata": strata,
+            "stratum_range_s": [round(lower, 6), round(upper, 6)], "stratum_seconds": [first, last],
+            "rule": START_RULE}
+
+
+def phase_schedule(mode, phases=None, condition=None, repetition=None):
+    offset = None
     if mode == "official":
-        if phases is not None and tuple(phases) != OFFICIAL_PHASES:
-            raise ValueError("official mode uses fixed phases 120/120/120")
-        phases = OFFICIAL_PHASES
+        if phases is not None:
+            raise ValueError("official mode derives the phases of each item (start offset); do not pass --phases")
+        offset = start_offset(condition, repetition)
+        s = offset["start_offset_s"]
+        phases = (s, INTERVENTION_S, TOTAL_S - INTERVENTION_S - s)
     elif mode == "test":
         phases = tuple(phases) if phases is not None else TEST_DEFAULT_PHASES
     else:
@@ -107,7 +178,14 @@ def phase_schedule(mode, phases=None):
         raise ValueError("phases must be three positive integers (seconds)")
     return {"phases_seconds": list(phases), "apply_offset_s": phases[0],
             "remove_offset_s": phases[0] + phases[1], "k6_duration": f"{sum(phases)}s",
-            "k6_duration_s": sum(phases)}
+            "k6_duration_s": sum(phases), "start_offset": offset}
+
+
+def lookup_timeout_ms(runner=None):
+    """STRESSER_TIMEOUT_SECONDS as `docker compose config` renders it (.env included), in whole ms."""
+    out = (runner or sh)(["docker", "compose", "config", "--format", "json"]).stdout
+    value = json.loads(out)["services"]["application-api"]["environment"]["STRESSER_TIMEOUT_SECONDS"]
+    return round(float(value) * 1000)
 
 
 def run_paths(base, run_id):
@@ -160,7 +238,10 @@ def parse_block(text):
     return int(k), int(n)
 
 
-def completed_items(base, mode, phases_seconds):
+def completed_items(base, mode, timeout_ms, phases=None):
+    """Valid runs whose condition values (at this lookup timeout) and phases match what the item would use now.
+
+    Runs of other catalogs (e.g. the v1 names) or of another timeout never match."""
     path = base / "control" / "runs.csv"
     if not path.exists():
         return {}
@@ -169,13 +250,15 @@ def completed_items(base, mode, phases_seconds):
         for row in csv.DictReader(f):
             if row["status"] != "valid" or row["mode"] != mode or row["condition"] not in CONDITIONS:
                 continue
+            item = (row["condition"], int(row["repetition"]))
             try:
                 record = json.loads((base / "control" / f"{row['experiment_run_id']}-phases.json").read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                expected = phase_schedule(mode, phases, *item)["phases_seconds"]
+            except (OSError, json.JSONDecodeError, ValueError):
                 continue
-            if (record.get("condition_params") == CONDITIONS[row["condition"]].params()
-                    and record.get("phases_seconds") == list(phases_seconds)):
-                done.setdefault((row["condition"], int(row["repetition"])), row["experiment_run_id"])
+            if (record.get("condition_params") == CONDITIONS[row["condition"]].params(timeout_ms)
+                    and record.get("phases_seconds") == expected):
+                done.setdefault(item, row["experiment_run_id"])
     return done
 
 
@@ -361,7 +444,7 @@ def precheck(mode):
     return git
 
 
-def recreate_api(seed, timeout=120):
+def recreate_api(seed, timeout=120, lookup_timeout=None):
     env = {**os.environ, "EXPERIMENT_SEED": str(seed)}
     sh(["docker", "compose", "up", "-d", "--no-deps", "--force-recreate", "application-api"], env=env, timeout=timeout)
     deadline = time.monotonic() + timeout
@@ -372,6 +455,11 @@ def recreate_api(seed, timeout=120):
     effective = sh(["docker", "compose", "exec", "-T", "application-api", "printenv", "EXPERIMENT_SEED"]).stdout.strip()
     if effective != str(seed):
         raise InfraError(f"EXPERIMENT_SEED in container is {effective!r}, expected {seed}")
+    if lookup_timeout is not None:
+        value = sh(["docker", "compose", "exec", "-T", "application-api", "printenv",
+                    "STRESSER_TIMEOUT_SECONDS"]).stdout.strip()
+        if round(float(value) * 1000) != lookup_timeout:
+            raise InfraError(f"STRESSER_TIMEOUT_SECONDS in container is {value!r}, expected {lookup_timeout} ms")
 
 
 def _action(label, method, url, payload=None):
@@ -383,15 +471,15 @@ def _action(label, method, url, payload=None):
             "status": status, "response": body, "_response_ns": responded}
 
 
-def apply_intervention(condition):
+def apply_intervention(condition, timeout_ms):
     actions = []
     if condition.stress_level:
         action = _action("stress_on", "POST", f"{STRESSER_URL}/api/stress", {"level": condition.stress_level})
         actions.append(action)
         if action["status"] != 200 or (action["response"] or {}).get("stress_level") != condition.stress_level:
             raise InfraError(f"stress not applied: {action['status']} {action['response']}")
-    if condition.toxic():
-        action = _action("toxic_on", "POST", f"{TOXIPROXY_URL}/proxies/{PROXY}/toxics", condition.toxic())
+    if condition.has_toxic:
+        action = _action("toxic_on", "POST", f"{TOXIPROXY_URL}/proxies/{PROXY}/toxics", condition.toxic(timeout_ms))
         actions.append(action)
         if action["status"] != 200 or (action["response"] or {}).get("name") != TOXIC_NAME:
             raise InfraError(f"toxic not applied: {action['status']} {action['response']}")
@@ -400,7 +488,7 @@ def apply_intervention(condition):
 
 def remove_intervention(condition):
     actions = []
-    if condition.toxic():
+    if condition.has_toxic:
         actions.append(_action("toxic_off", "DELETE", f"{TOXIPROXY_URL}/proxies/{PROXY}/toxics/{TOXIC_NAME}"))
     if condition.stress_level:
         actions.append(_action("stress_off", "POST", f"{STRESSER_URL}/api/stress", {"level": 0}))
@@ -426,9 +514,9 @@ def cleanup(attempts=3):
 
 
 class K6Process:
-    def __init__(self, run_id, scenario, duration):
+    def __init__(self, run_id, scenario, duration, k6_seed):
         self.args = [sys.executable, "-I", "-B", str(REPO / "load-tests" / "run.py"),
-                     "--testid", run_id, "--scenario", scenario]
+                     "--testid", run_id, "--scenario", scenario, "--seed", str(k6_seed)]
         self.env = {**os.environ, "K6_TEST_DURATION": duration}
         self.lines, self.proc, self.thread = [], None, None
 
@@ -499,31 +587,35 @@ def _raise_interrupt(signum, frame):
     raise _Interrupted(f"signal {signum}")
 
 
-def run_one(condition_name, repetition, mode, phases=None, batch=None, data_root=DATA_ROOT):
+def run_one(condition_name, repetition, mode, phases=None, batch=None, data_root=DATA_ROOT, timeout_ms=None):
     condition = CONDITIONS[condition_name]
-    schedule = phase_schedule(mode, phases)
+    schedule = phase_schedule(mode, phases, condition_name, repetition)
     base = data_root / MODE_DIRS[mode]
     log(f"pre-checks ({mode})")
     git = precheck(mode)
+    timeout_ms = timeout_ms if timeout_ms is not None else lookup_timeout_ms()
     seed = derive_seed(condition_name, repetition)
+    k6_seed = derive_k6_seed(condition_name, repetition)
     run_id = str(uuid.uuid4())
     paths = run_paths(base, run_id)
     for key in ("raw", "phases"):
         if paths[key].exists():
             raise InfraError(f"{paths[key]} already exists")
     log(f"recreating application-api with EXPERIMENT_SEED={seed}")
-    recreate_api(seed)
+    recreate_api(seed, lookup_timeout=timeout_ms)
     state, toxics = stack_state()
     if state != {"stress_level": 0, "cpu_workers": 0} or toxics != []:
         raise InfraError(f"unexpected state after recreation: {state} {toxics}")
 
     record = {
         "orchestrator_version": VERSION, "experiment_run_id": run_id, "condition": condition_name,
-        "condition_params": condition.params(), "repetition": repetition, "mode": mode, "seed": seed,
+        "condition_params": condition.params(timeout_ms), "repetition": repetition, "mode": mode, "seed": seed,
+        "k6_seed": k6_seed, "k6_seed_rule": K6_SEED_RULE,
+        "network_rule": NETWORK_RULE if condition.has_toxic else None,
         "git": git, "batch": batch, "phases_seconds": schedule["phases_seconds"],
-        "k6_duration": schedule["k6_duration"],
+        "start_offset": schedule["start_offset"], "k6_duration": schedule["k6_duration"],
     }
-    k6 = K6Process(run_id, condition.k6_scenario, schedule["k6_duration"])
+    k6 = K6Process(run_id, condition.k6_scenario, schedule["k6_duration"], k6_seed)
     apply_actions, remove_actions, error = [], [], None
     previous = {s: signal.getsignal(s) for s in _signals()}
     for s in previous:
@@ -541,7 +633,7 @@ def run_one(condition_name, repetition, mode, phases=None, batch=None, data_root
         log(f"run {run_id}: k6 scenario={condition.k6_scenario} duration={schedule['k6_duration']}")
         k6.start()
         sleep_until(t0_mono + schedule["apply_offset_s"])
-        apply_actions = apply_intervention(condition)
+        apply_actions = apply_intervention(condition, timeout_ms)
         log(f"intervention applied: {[a['action'] for a in apply_actions] or 'none (baseline)'}")
         sleep_until(t0_mono + schedule["remove_offset_s"])
         remove_actions = remove_intervention(condition)
@@ -613,17 +705,25 @@ def _signals():
     return [getattr(signal, n) for n in names if hasattr(signal, n)]
 
 
-def describe_plan(plan, mode, phases, batch_seed=None):
-    schedule = phase_schedule(mode, phases)
-    lines = [f"mode={mode} output={DATA_ROOT / MODE_DIRS[mode]} phases={schedule['phases_seconds']} "
-             f"k6={schedule['k6_duration']} batch_seed={batch_seed}"]
+def describe_plan(plan, mode, phases, batch_seed=None, timeout_ms=None):
+    lines = [f"mode={mode} output={DATA_ROOT / MODE_DIRS[mode]} lookup_timeout_ms={timeout_ms} batch_seed={batch_seed}",
+             f"network: {NETWORK_RULE}", f"k6 seed: {K6_SEED_RULE}"]
+    if mode == "official":
+        lines.append(f"start: {START_RULE}")
+    minutes = 0.0
     for position, (name, rep) in enumerate(plan, 1):
         c = CONDITIONS[name]
-        toxic = f"latency {c.toxic_latency_ms} jitter {c.toxic_jitter_ms} ms" if c.toxic_latency_ms else "none"
-        lines.append(f"{position:>3}. {name:<16} rep={rep:<2} seed={derive_seed(name, rep):<10} k6_tag={c.k6_scenario:<15} "
-                     f"stress={c.stress_level:<3} toxic={toxic:<27} apply=t0+{schedule['apply_offset_s']}s "
-                     f"remove=t0+{schedule['remove_offset_s']}s")
-    lines.append(f"runs={len(plan)} estimated wall time ~{len(plan) * run_minutes(schedule):.1f} min (incl. recreation/export)")
+        schedule = phase_schedule(mode, phases, name, rep)
+        values = c.toxic_values(timeout_ms) if timeout_ms is not None else None
+        toxic = f"latency {values[0]} jitter {values[1]} ms" if values else ("none" if not c.has_toxic else "?")
+        offset = schedule["start_offset"]
+        stratum = f" stratum={offset['stratum']}/{offset['strata']}{offset['stratum_seconds']}" if offset else ""
+        lines.append(f"{position:>3}. {name:<15} rep={rep:<2} seed={derive_seed(name, rep):<10} "
+                     f"k6_seed={derive_k6_seed(name, rep):<10} k6_tag={c.k6_scenario:<15} stress={c.stress_level:<3} "
+                     f"toxic={toxic:<25} phases={schedule['phases_seconds']} apply=t0+{schedule['apply_offset_s']}s "
+                     f"remove=t0+{schedule['remove_offset_s']}s{stratum}")
+        minutes += run_minutes(schedule)
+    lines.append(f"runs={len(plan)} estimated wall time ~{minutes:.1f} min (incl. recreation/export)")
     return "\n".join(lines)
 
 
@@ -632,7 +732,7 @@ def run_minutes(schedule):
 
 
 def describe_blocks(blocks, selected, done, mode, phases):
-    minutes = run_minutes(phase_schedule(mode, phases))
+    minutes = run_minutes(phase_schedule(mode, phases, *blocks[0][0][1]))
     lines = [f"blocks={len(blocks)}"]
     for index, block in enumerate(blocks, 1):
         counts = {}
@@ -680,17 +780,20 @@ def main(argv=None):
             plan, batch_seed = official_plan(args.plan_seed), args.plan_seed
         if args.mode == "official":
             check_official_items(plan)
-        print(describe_plan(plan, args.mode, args.phases, batch_seed))
+        timeout_ms = lookup_timeout_ms()
+        print(describe_plan(plan, args.mode, args.phases, batch_seed, timeout_ms))
         queue = list(enumerate(plan, 1))
         if args.command == "plan":
             selected, count = args.block
             blocks = split_blocks(queue, count)
-            schedule = phase_schedule(args.mode, args.phases)
-            done = completed_items(DATA_ROOT / MODE_DIRS[args.mode], args.mode, schedule["phases_seconds"])
+            done = completed_items(DATA_ROOT / MODE_DIRS[args.mode], args.mode, timeout_ms, args.phases)
             print(describe_blocks(blocks, selected, done, args.mode, args.phases))
             queue = [(position, item) for position, item in blocks[selected - 1] if item not in done]
     except ValueError as error:
         parser.error(str(error))
+    except InfraError as error:
+        print(f"ABORT: cannot read the lookup timeout from docker compose config: {error}", file=sys.stderr)
+        return 2
     if args.dry_run:
         print("dry-run: nothing executed")
         return 0
@@ -706,7 +809,7 @@ def main(argv=None):
             batch.update(plan="official", block=f"{selected}/{count}")
         label = f"{index}/{len(queue)} (position {position})"
         try:
-            record = run_one(name, rep, args.mode, args.phases, batch)
+            record = run_one(name, rep, args.mode, args.phases, batch, timeout_ms=timeout_ms)
         except PrecheckError as error:
             print(f"ABORT before run {label}: {error}", file=sys.stderr)
             return 2

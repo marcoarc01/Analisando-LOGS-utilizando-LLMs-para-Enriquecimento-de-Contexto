@@ -7,9 +7,9 @@ from pathlib import Path
 
 import build_windows as b
 import sanitize
-from common import CONDITIONS, DERIVED_DIR, OFFICIAL_DIR, PipelineError, sha256_bytes
+from common import CONDITION_NAMES, DERIVED_DIR, OFFICIAL_DIR, PipelineError, sha256_bytes
 
-FORBIDDEN_RE = re.compile("|".join(re.escape(t) for t in CONDITIONS + (
+FORBIDDEN_RE = re.compile("|".join(re.escape(t) for t in CONDITION_NAMES + (
     "label", "phase", "normal", "interven", "transic", "latency", "status", "rate_", "median", "condition")))
 CHECKS = ("files", "fields", "counts", "coverage", "state_service", "templates", "forbidden", "labels", "p99",
           "rebuild", "manifest")

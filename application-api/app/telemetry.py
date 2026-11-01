@@ -18,6 +18,11 @@ MESSAGES = {
     "experimental_500": "Request failed",
     "experimental_503": "Request unavailable",
     "stresser_lookup_failed": "Dependency lookup failed",
+    "dependency_connection_opened": "Dependency connection opened",
+    "dependency_connection_closed": "Dependency connection closed",
+    "dependency_request_sent": "Dependency request sent",
+    "dependency_response_received": "Dependency response received",
+    "dependency_response_failed": "Dependency response failed",
 }
 
 

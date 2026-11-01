@@ -50,7 +50,9 @@ def test_dependency_failure_keeps_correlation(environment):
         headers={"X-Request-ID": "failure-001", "X-Experiment-Run-ID": "run-001"},
     )
     assert response.status_code == 503
-    record = json.loads(environment.logs.getvalue())
+    failed, record = map(json.loads, environment.logs.getvalue().splitlines())
+    assert (failed["event"], failed["error"]) == ("dependency_response_failed", "ConnectError")
+    assert (failed["request_id"], failed["experiment_run_id"]) == ("failure-001", "run-001")
     assert record["event"] == "stresser_lookup_failed"
     assert record["request_id"] == "failure-001"
     assert record["experiment_run_id"] == "run-001"

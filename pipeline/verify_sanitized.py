@@ -8,9 +8,9 @@ from pathlib import Path
 
 import sanitize as s
 import split_runs
-from common import CONDITIONS, DERIVED_DIR, OFFICIAL_DIR, PipelineError, sha256_bytes, valid_runs
+from common import CONDITION_NAMES, DERIVED_DIR, OFFICIAL_DIR, PipelineError, sha256_bytes, valid_runs
 
-FORBIDDEN_TERMS = ("stress", "experimental", "inject", "toxi", "chaos", "fault", "8666", "8474") + CONDITIONS
+FORBIDDEN_TERMS = ("stress", "experimental", "inject", "toxi", "chaos", "fault", "8666", "8474") + CONDITION_NAMES
 TERMS_RE = re.compile("|".join(re.escape(t) for t in FORBIDDEN_TERMS))
 NAME_TERMS_RE = re.compile("|".join(re.escape(t) for t in FORBIDDEN_TERMS if not t.isdigit()))
 FORMAT_FIELDS = ("ts", "req")

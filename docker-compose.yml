@@ -3,16 +3,18 @@ services:
     image: application-api:1.0.0
     build: ./application-api
     # Dataset v2: falha de CPU real, sem a politica sintetica (o v1 e o commit 4b45cde e as imagens *-v1-backup).
-    # Trabalho por requisicao e timeout sao provisorios: serao recalibrados depois dos logs intermediarios.
+    # Recalibrado em 2026-11-01 com os logs intermediarios, o jitter do k6, stress 0 e Toxiproxy transparente
+    # (registros em C:\tcc-data\pilot\v2-calibration\calibration\).
     environment:
       - STRESSER_BASE_URL=${STRESSER_BASE_URL:-http://toxiproxy:8666}
       # Timeout = p99,9 da consulta ao Go vista pelo httpx (AWS Builders' Library, "Timeouts, retries and
-      # backoff with jitter": 0,1% de timeouts falsos): 302,89 ms em 2.430 chamadas, arredondado para cima.
-      - STRESSER_TIMEOUT_SECONDS=${STRESSER_TIMEOUT_SECONDS:-0.303}
+      # backoff with jitter": 0,1% de timeouts falsos): 291,256 ms em 12.150 chamadas (25 min, medidas com
+      # timeout de 2 s para nao truncar a cauda; IC 95% 282,8-309,7 ms), arredondado para cima.
+      - STRESSER_TIMEOUT_SECONDS=${STRESSER_TIMEOUT_SECONDS:-0.292}
       - EXPERIMENT_SEED=${EXPERIMENT_SEED:-42}
       - MAX_EXPERIMENT_DELAY_MS=${MAX_EXPERIMENT_DELAY_MS:-2000}
       - DEGRADATION_POLICY=off
-      # 50% de 1 CPU com a carga normal do k6 (meta do exemplo oficial do HPA do Kubernetes), medido em 180 s.
+      # 50% de 1 CPU com a carga normal do k6 (meta do exemplo oficial do HPA do Kubernetes): 50,35% em 180 s.
       - REQUEST_WORK_ITERATIONS=${REQUEST_WORK_ITERATIONS:-218000}
     # Cota de 1 CPU, como limits.cpu do Kubernetes; sem cpuset; 1 processo do uvicorn por container.
     deploy:
@@ -58,8 +60,9 @@ services:
       - STRESS_MODE=duty
       # GOMAXPROCS igual a cota de CPU (o runtime do Go faz isso sozinho a partir do 1.25).
       - GOMAXPROCS=1
-      # 50% de 1 CPU com a carga normal do k6 (meta do exemplo oficial do HPA do Kubernetes), medido em 180 s.
-      - STATE_WORK_ITERATIONS=${STATE_WORK_ITERATIONS:-1064000}
+      # 50% de 1 CPU com a carga normal do k6 (meta do exemplo oficial do HPA do Kubernetes): 49,95% em 180 s
+      # (recalibrado em 2026-11-01 com os logs intermediarios e o jitter).
+      - STATE_WORK_ITERATIONS=${STATE_WORK_ITERATIONS:-1222000}
     restart: unless-stopped
     # Cota de 1 CPU, como limits.cpu do Kubernetes; sem cpuset.
     deploy:
@@ -156,6 +159,8 @@ services:
       K6_TEST_DURATION: ${K6_TEST_DURATION:-30s}
       K6_EXPERIMENT_RUN_ID: ${K6_EXPERIMENT_RUN_ID:-}
       K6_SCENARIO: ${K6_SCENARIO:-baseline}
+      # Jitter seed (required by baseline.js): the orchestrator derives one per run.
+      K6_SEED: ${K6_SEED:-}
       K6_MAX_EXPERIMENT_DELAY_MS: ${MAX_EXPERIMENT_DELAY_MS:-2000}
       K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
       K6_PROMETHEUS_RW_TREND_STATS: avg,p(50),p(95),p(99),max

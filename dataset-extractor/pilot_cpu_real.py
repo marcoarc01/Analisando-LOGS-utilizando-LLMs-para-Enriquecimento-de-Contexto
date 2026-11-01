@@ -131,8 +131,8 @@ def instrument(state):
         state["readings"].append({"label": label, "utc_ns": time.time_ns(),
                                   "cpu_stat": {s: cpu_stat(c) for s, c in state["ids"].items()}})
 
-    def recreate_api(seed, timeout=120):
-        recreate(seed, timeout)
+    def recreate_api(seed, *args, **kwargs):
+        recreate(seed, *args, **kwargs)
         state["ids"] = container_ids()
         check_config(state["ids"], state["expected"])
         state["gomaxprocs"] = go_gomaxprocs(state["ids"]["stresser-app"])
@@ -153,9 +153,9 @@ def instrument(state):
             reading("end")
             state["sampler"].stop()
 
-    def apply_intervention(condition):
+    def apply_intervention(condition, *args):
         reading("apply")
-        return apply(condition)
+        return apply(condition, *args)
 
     def remove_intervention(condition):
         reading("remove")

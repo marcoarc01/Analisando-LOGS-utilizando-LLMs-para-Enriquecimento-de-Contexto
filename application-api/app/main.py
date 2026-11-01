@@ -25,6 +25,7 @@ def create_app(settings=None, stresser_factory=StresserClient, sleep=asyncio.sle
         application.state.sleep = sleep
         application.state.request_work_iterations = config.request_work_iterations
         application.state.logger = create_logger()
+        application.state.stresser.logger = application.state.logger
         try:
             yield
         finally:

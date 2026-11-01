@@ -6,10 +6,10 @@ import sys
 from pathlib import Path
 
 import drain_templates as d
-from common import CONDITIONS, DERIVED_DIR, PipelineError, sha256_bytes
+from common import CONDITION_NAMES, DERIVED_DIR, PipelineError, sha256_bytes
 
 FORBIDDEN_RE = re.compile("|".join(re.escape(t) for t in
-                                   ("stress", "experimental", "inject", "toxi", "chaos", "fault") + CONDITIONS))
+                                   ("stress", "experimental", "inject", "toxi", "chaos", "fault") + CONDITION_NAMES))
 LEAK_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\b[0-9a-f]{12}\b|\d{10,}")
 RUN_FIELDS = ["ts", "req", "service", "template_id"]
 CHECKS = ("config", "files", "encoding", "lines", "alignment", "template_ids", "template_text", "unk_train",

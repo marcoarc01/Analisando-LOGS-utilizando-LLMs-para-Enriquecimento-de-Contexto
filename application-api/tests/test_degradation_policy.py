@@ -63,7 +63,8 @@ def test_off_policy_keeps_real_lookup_failures(make_environment, error):
     env.error = error
     response = call(env.client, "/products")
     assert response.status_code == 503
-    [record] = records(env)
+    failed, record = records(env)
+    assert (failed["event"], failed["error"]) == ("dependency_response_failed", type(error).__name__)
     assert record["event"] == "stresser_lookup_failed"
     assert record["error_type"] == type(error).__name__
     assert env.app.state.metrics.lookup_failures._value.get() == 1

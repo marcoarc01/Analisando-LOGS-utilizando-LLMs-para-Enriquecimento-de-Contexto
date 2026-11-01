@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -50,6 +52,18 @@ func stateHandlerWithWork(engine StressEngine, logger *slog.Logger, workIteratio
 			sum := chainedSHA256(workIterations)
 			workSink.Store(uint32(sum[0]))
 		}
+		// The client may have given up (for instance on its own timeout) while the
+		// work ran: record that instead of answering a request nobody waits for.
+		if reason := canceledReason(ctx.Err()); reason != "" {
+			fields := append([]any{
+				"event", "state_request_canceled",
+				"method", r.Method,
+				"route", "/api/state",
+				"error", reason,
+			}, correlationFields(r)...)
+			logger.WarnContext(ctx, "State request canceled", fields...)
+			return
+		}
 
 		level := engine.GetLevel()
 		workers := engine.GetWorkers()
@@ -74,14 +88,28 @@ func stateHandlerWithWork(engine StressEngine, logger *slog.Logger, workIteratio
 			"stress_level", level,
 			"cpu_workers", workers,
 		}
-		for header, field := range map[string]string{
-			"X-Request-ID":        "request_id",
-			"X-Experiment-Run-ID": "experiment_run_id",
-		} {
-			if value := r.Header.Get(header); correlationIDPattern.MatchString(value) {
-				fields = append(fields, field, value)
-			}
-		}
+		fields = append(fields, correlationFields(r)...)
 		logger.InfoContext(ctx, "state queried", fields...)
 	}
+}
+
+func correlationFields(r *http.Request) []any {
+	var fields []any
+	for _, pair := range [][2]string{{"X-Request-ID", "request_id"}, {"X-Experiment-Run-ID", "experiment_run_id"}} {
+		if value := r.Header.Get(pair[0]); correlationIDPattern.MatchString(value) {
+			fields = append(fields, pair[1], value)
+		}
+	}
+	return fields
+}
+
+// canceledReason maps a request context error to a fixed text, never its details.
+func canceledReason(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context deadline exceeded"
+	case errors.Is(err, context.Canceled):
+		return "context canceled"
+	}
+	return ""
 }
