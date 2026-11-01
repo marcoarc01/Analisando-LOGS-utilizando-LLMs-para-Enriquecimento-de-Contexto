@@ -480,5 +480,64 @@ class ResumeTest(unittest.TestCase):
         self.assertIn("nothing to run", text)
 
 
+V1_OFFICIAL = Path(r"C:\tcc-data\official")
+
+
+class OutputDirTest(unittest.TestCase):
+    r"""No orchestrator command writes under C:\tcc-data\official (the v1 collection) any more."""
+
+    def test_official_v2_and_validation_dirs(self):
+        self.assertEqual(o.DATA_ROOT / o.MODE_DIRS["official"], Path(r"C:\tcc-data\official-v2"))
+        self.assertEqual(o.DATA_ROOT / o.MODE_DIRS["validation"], Path(r"C:\tcc-data\pilot\v2-validation"))
+        for mode, name in o.MODE_DIRS.items():
+            base = o.DATA_ROOT / name
+            self.assertNotEqual(base, V1_OFFICIAL)
+            self.assertNotIn(V1_OFFICIAL, base.parents)
+            o.guard_output(base / "control" / "runs.csv")
+
+    def test_guard_refuses_protected_paths(self):
+        for path in (V1_OFFICIAL, V1_OFFICIAL / "control" / "runs.csv", V1_OFFICIAL / "raw" / f"{RUN_ID}.jsonl",
+                     Path(r"c:\TCC-DATA\Official\control\manifest.sha256"),
+                     Path(r"C:\tcc-data\official-v2\..\official\control\runs.csv"),
+                     Path(r"C:\tcc-data\derived\v1\x.json"), Path(r"C:\tcc-data\results\v1\x.json")):
+            with self.subTest(path=str(path)), self.assertRaises(o.OutputGuardError):
+                o.guard_output(path)
+        o.guard_output(Path(r"C:\tcc-data\official-v2\control\runs.csv"))
+        o.guard_output(Path(r"C:\tcc-data\officialx\a"))
+
+    def test_writers_refuse_before_touching_disk(self):
+        name = f"guard-test-{uuid.uuid4()}"
+        target = V1_OFFICIAL / "control" / name
+        for write in (lambda: o.write_new(target, b"x"), lambda: o.append_manifest(target, [("a" * 64, "x")]),
+                      lambda: o.append_runs_row(target, o.runs_row(sample_record()))):
+            with self.assertRaises(o.OutputGuardError):
+                write()
+        self.assertFalse(target.exists())
+
+    def test_run_one_refuses_v1_dir_before_any_action(self):
+        with mock.patch.dict(o.MODE_DIRS, {"official": "official"}), \
+                mock.patch.object(o, "precheck", side_effect=AssertionError("precheck must not run")):
+            with self.assertRaises(o.OutputGuardError):
+                o.run_one("baseline", 1, "official", timeout_ms=TIMEOUT_MS)
+
+    def test_validation_mode_uses_the_official_derivations(self):
+        for condition in o.CONDITIONS:
+            self.assertEqual(o.phase_schedule("validation", None, condition, 1),
+                             o.phase_schedule("official", None, condition, 1))
+        with self.assertRaises(ValueError):
+            o.phase_schedule("validation", [20, 20, 20], "baseline", 1)
+        with self.assertRaises(ValueError):
+            o.check_official_items([("cpu75", 6)])
+        out = io.StringIO()
+        with mock.patch.object(o, "lookup_timeout_ms", lambda: TIMEOUT_MS), contextlib.redirect_stdout(out):
+            code = o.main(["run", "--mode", "validation", "--condition", "net_slow", "--repetition", "1", "--dry-run"])
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn(r"output=C:\tcc-data\pilot\v2-validation", text)
+        start = o.start_offset("net_slow", 1)["start_offset_s"]
+        self.assertIn(f"apply=t0+{start}s remove=t0+{start + 120}s", text)
+        self.assertIn("latency 76 jitter 11 ms", text)
+
+
 if __name__ == "__main__":
     unittest.main()

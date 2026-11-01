@@ -20,10 +20,15 @@ from pathlib import Path
 
 import exporter
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 REPO = Path(__file__).resolve().parents[1]
 DATA_ROOT = Path(r"C:\tcc-data")
-MODE_DIRS = {"official": "official", "test": "test-runs"}
+# Dataset v2 official collection in official-v2; C:\tcc-data\official is the v1 collection and is never written.
+# validation: one item per condition with exactly the official derivations (start offset, phases, k6 seed,
+# network values), written apart from the official data.
+MODE_DIRS = {"official": "official-v2", "validation": r"pilot\v2-validation", "test": "test-runs"}
+DERIVED_MODES = ("official", "validation")
+PROTECTED_DIRS = tuple(DATA_ROOT / name for name in ("official", "derived", "results"))
 TEST_DEFAULT_PHASES = (30, 30, 30)
 SEED_NAMESPACE = "tcc-experiment-seed-v1"
 K6_SEED_NAMESPACE = "tcc-k6-seed-v1"
@@ -65,6 +70,20 @@ RUNS_COLUMNS = [
     "k6_dropped_iterations", "fastapi_final_events", "lookup_requests", "go_state_queried",
     "one_to_one", "jsonl_lines", "jsonl_sha256", "status", "reason",
 ]
+
+
+class OutputGuardError(ValueError):
+    pass
+
+
+def guard_output(path):
+    """Refuse any write at or under a protected directory (the v1 collection, derived data, results)."""
+    resolved = Path(os.path.abspath(path))
+    for protected in PROTECTED_DIRS:
+        if os.path.normcase(str(resolved)) == os.path.normcase(str(protected)) or any(
+                os.path.normcase(str(parent)) == os.path.normcase(str(protected)) for parent in resolved.parents):
+            raise OutputGuardError(f"refusing to write under protected {protected}: {resolved}")
+    return path
 
 
 class PrecheckError(Exception):
@@ -164,9 +183,9 @@ def start_offset(condition, repetition):
 
 def phase_schedule(mode, phases=None, condition=None, repetition=None):
     offset = None
-    if mode == "official":
+    if mode in DERIVED_MODES:
         if phases is not None:
-            raise ValueError("official mode derives the phases of each item (start offset); do not pass --phases")
+            raise ValueError(f"{mode} mode derives the phases of each item (start offset); do not pass --phases")
         offset = start_offset(condition, repetition)
         s = offset["start_offset_s"]
         phases = (s, INTERVENTION_S, TOTAL_S - INTERVENTION_S - s)
@@ -325,6 +344,7 @@ def phases_bytes(record):
 
 
 def write_new(path, content):
+    guard_output(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "xb") as f:
         f.write(content)
@@ -332,6 +352,7 @@ def write_new(path, content):
 
 
 def append_runs_row(path, row):
+    guard_output(path)
     header = ",".join(RUNS_COLUMNS) + "\n"
     if path.exists():
         with open(path, "rb") as f:
@@ -347,6 +368,7 @@ def append_runs_row(path, row):
 
 
 def append_manifest(path, entries):
+    guard_output(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "ab") as f:
         f.write("".join(f"{sha}  {name}\n" for sha, name in entries).encode("utf-8"))
@@ -590,7 +612,7 @@ def _raise_interrupt(signum, frame):
 def run_one(condition_name, repetition, mode, phases=None, batch=None, data_root=DATA_ROOT, timeout_ms=None):
     condition = CONDITIONS[condition_name]
     schedule = phase_schedule(mode, phases, condition_name, repetition)
-    base = data_root / MODE_DIRS[mode]
+    base = guard_output(data_root / MODE_DIRS[mode])
     log(f"pre-checks ({mode})")
     git = precheck(mode)
     timeout_ms = timeout_ms if timeout_ms is not None else lookup_timeout_ms()
@@ -670,7 +692,7 @@ def run_one(condition_name, repetition, mode, phases=None, batch=None, data_root
         k6_info["by_endpoint_status"], k6_info["status0"] = k6_status_counts(run_id, schedule["k6_duration_s"])
         try:
             rows, stats = exporter.collect(run_id, t0, k6_end, loki_url=LOKI_URL)
-            lines, sha = exporter.write_jsonl(paths["raw"], rows)
+            lines, sha = exporter.write_jsonl(guard_output(paths["raw"]), rows)
             record["export"] = {**stats, "path": f"raw/{run_id}.jsonl", "lines": lines, "sha256": sha,
                                 "first_event_utc": exporter.iso(rows[0][0]) if rows else None,
                                 "last_event_utc": exporter.iso(rows[-1][0]) if rows else None}
@@ -708,7 +730,7 @@ def _signals():
 def describe_plan(plan, mode, phases, batch_seed=None, timeout_ms=None):
     lines = [f"mode={mode} output={DATA_ROOT / MODE_DIRS[mode]} lookup_timeout_ms={timeout_ms} batch_seed={batch_seed}",
              f"network: {NETWORK_RULE}", f"k6 seed: {K6_SEED_RULE}"]
-    if mode == "official":
+    if mode in DERIVED_MODES:
         lines.append(f"start: {START_RULE}")
     minutes = 0.0
     for position, (name, rep) in enumerate(plan, 1):
@@ -778,7 +800,7 @@ def main(argv=None):
             plan, batch_seed = batch_plan(names, args.repetitions, args.batch_seed), args.batch_seed
         else:
             plan, batch_seed = official_plan(args.plan_seed), args.plan_seed
-        if args.mode == "official":
+        if args.mode in DERIVED_MODES:
             check_official_items(plan)
         timeout_ms = lookup_timeout_ms()
         print(describe_plan(plan, args.mode, args.phases, batch_seed, timeout_ms))
