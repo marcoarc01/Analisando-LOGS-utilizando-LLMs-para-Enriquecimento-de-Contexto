@@ -17,10 +17,13 @@ def create_app(settings=None, stresser_factory=StresserClient, sleep=asyncio.sle
     async def lifespan(application):
         config = settings or Settings.from_env()
         application.state.stresser = stresser_factory(config)
-        application.state.policy = DegradationPolicy(
-            config.experiment_seed, config.max_experiment_delay_ms
+        application.state.policy = (
+            DegradationPolicy(config.experiment_seed, config.max_experiment_delay_ms)
+            if config.degradation_policy == "synthetic"
+            else None
         )
         application.state.sleep = sleep
+        application.state.request_work_iterations = config.request_work_iterations
         application.state.logger = create_logger()
         try:
             yield

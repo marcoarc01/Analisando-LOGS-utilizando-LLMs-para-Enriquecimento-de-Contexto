@@ -44,3 +44,33 @@ def environment():
 @pytest.fixture
 def client(environment):
     return environment.client
+
+
+@pytest.fixture
+def make_environment():
+    clients = []
+
+    def build(**settings):
+        env = SimpleNamespace(level=0, calls=0, error=None, sleep=AsyncMock(), logs=StringIO())
+
+        def handler(request):
+            env.calls += 1
+            if env.error:
+                raise env.error
+            return httpx.Response(200, json={"stress_level": env.level, "cpu_workers": 0})
+
+        app = create_app(
+            Settings(**settings),
+            stresser_factory=lambda config: StresserClient(config, httpx.MockTransport(handler)),
+            sleep=env.sleep,
+        )
+        client = TestClient(app)
+        client.__enter__()
+        clients.append(client)
+        app.state.logger.handlers[0].setStream(env.logs)
+        env.app, env.client = app, client
+        return env
+
+    yield build
+    for client in clients:
+        client.__exit__(None, None, None)

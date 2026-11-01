@@ -2,11 +2,23 @@ services:
   application-api:
     image: application-api:1.0.0
     build: ./application-api
+    # Dataset v2: falha de CPU real, sem a politica sintetica (o v1 e o commit 4b45cde e as imagens *-v1-backup).
+    # Trabalho por requisicao e timeout sao provisorios: serao recalibrados depois dos logs intermediarios.
     environment:
       - STRESSER_BASE_URL=${STRESSER_BASE_URL:-http://toxiproxy:8666}
-      - STRESSER_TIMEOUT_SECONDS=${STRESSER_TIMEOUT_SECONDS:-2}
+      # Timeout = p99,9 da consulta ao Go vista pelo httpx (AWS Builders' Library, "Timeouts, retries and
+      # backoff with jitter": 0,1% de timeouts falsos): 302,89 ms em 2.430 chamadas, arredondado para cima.
+      - STRESSER_TIMEOUT_SECONDS=${STRESSER_TIMEOUT_SECONDS:-0.303}
       - EXPERIMENT_SEED=${EXPERIMENT_SEED:-42}
       - MAX_EXPERIMENT_DELAY_MS=${MAX_EXPERIMENT_DELAY_MS:-2000}
+      - DEGRADATION_POLICY=off
+      # 50% de 1 CPU com a carga normal do k6 (meta do exemplo oficial do HPA do Kubernetes), medido em 180 s.
+      - REQUEST_WORK_ITERATIONS=${REQUEST_WORK_ITERATIONS:-218000}
+    # Cota de 1 CPU, como limits.cpu do Kubernetes; sem cpuset; 1 processo do uvicorn por container.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -42,11 +54,18 @@ services:
       - STRESSER_PORT=8080
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
       - OTEL_SERVICE_NAME=stresser-app
+      # Estresse real: uma goroutine por P, ocupada level% de cada ciclo de 100 ms.
+      - STRESS_MODE=duty
+      # GOMAXPROCS igual a cota de CPU (o runtime do Go faz isso sozinho a partir do 1.25).
+      - GOMAXPROCS=1
+      # 50% de 1 CPU com a carga normal do k6 (meta do exemplo oficial do HPA do Kubernetes), medido em 180 s.
+      - STATE_WORK_ITERATIONS=${STATE_WORK_ITERATIONS:-1064000}
     restart: unless-stopped
+    # Cota de 1 CPU, como limits.cpu do Kubernetes; sem cpuset.
     deploy:
       resources:
         limits:
-          cpus: "2.0"
+          cpus: "1.0"
           memory: "512M"
     depends_on:
       - otel-collector

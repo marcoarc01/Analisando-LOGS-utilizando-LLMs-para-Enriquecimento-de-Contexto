@@ -1,3 +1,5 @@
+import time
+
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
@@ -27,6 +29,16 @@ class StresserClient:
             follow_redirects=False,
             trust_env=False,
         )
+        self.timing = (
+            open(settings.lookup_timing_file, "a", encoding="ascii", buffering=1)
+            if settings.lookup_timing_file
+            else None
+        )
+
+    def _record(self, started_ns: int, outcome: str) -> None:
+        if self.timing is not None:
+            ended = time.perf_counter_ns()
+            self.timing.write(f"{time.time_ns()},{ended - started_ns},{outcome}\n")
 
     async def get_level(
         self, *, request_id: str | None = None, experiment_run_id: str | None = None
@@ -37,7 +49,13 @@ class StresserClient:
         if experiment_run_id:
             headers["X-Experiment-Run-ID"] = experiment_run_id
         try:
-            response = await self.http.get("/api/state", headers=headers)
+            started = time.perf_counter_ns()
+            try:
+                response = await self.http.get("/api/state", headers=headers)
+            except httpx.HTTPError as error:
+                self._record(started, type(error).__name__)
+                raise
+            self._record(started, "ok")
             response.raise_for_status()
             return StressState.model_validate(response.json()).stress_level
         except httpx.HTTPStatusError as error:
@@ -49,3 +67,5 @@ class StresserClient:
 
     async def aclose(self) -> None:
         await self.http.aclose()
+        if self.timing is not None:
+            self.timing.close()

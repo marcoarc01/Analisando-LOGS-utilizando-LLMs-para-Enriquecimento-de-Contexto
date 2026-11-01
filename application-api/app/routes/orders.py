@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from app.experiment import apply_experiment
 from app.models import OrderRequest, OrderResponse
 from app.routes.products import PRODUCTS
+from app.work import request_work
 
 router = APIRouter(tags=["orders"])
 
@@ -29,6 +30,7 @@ async def create_order(
     if override is not None:
         return override
 
+    request_work(request)
     return OrderResponse(
         product_id=product.id,
         quantity=order.quantity,

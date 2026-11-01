@@ -1,6 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from app.models import HealthResponse, LiveResponse
+from app.work import request_work
 
 router = APIRouter(tags=["health"])
 
@@ -18,7 +19,8 @@ def live() -> LiveResponse:
         503: {"description": "Indisponibilidade experimental ou do Go"},
     },
 )
-def health() -> HealthResponse:
+def health(request: Request) -> HealthResponse:
+    request_work(request)
     return HealthResponse()
 
 

@@ -35,7 +35,7 @@ async def apply_experiment(
         context.error_type = error.error_type
         return JSONResponse({"detail": "Dependência indisponível"}, status_code=503)
 
-    if not degrade:
+    if not degrade or state.policy is None:
         return None
 
     decision = state.policy.decide(context.stress_level)

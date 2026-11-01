@@ -1,6 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from app.models import Product
+from app.work import request_work
 
 router = APIRouter(tags=["products"])
 
@@ -19,5 +20,6 @@ PRODUCTS = (
         503: {"description": "Indisponibilidade experimental ou do Go"},
     },
 )
-def products() -> tuple[Product, ...]:
+def products(request: Request) -> tuple[Product, ...]:
+    request_work(request)
     return PRODUCTS

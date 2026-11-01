@@ -26,15 +26,30 @@ type StateResponse struct {
 var correlationIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 
 func StateHandler(engine StressEngine) http.HandlerFunc {
-	return stateHandler(engine, telemetry.Logger)
+	return StateHandlerWithWork(engine, 0)
+}
+
+// StateHandlerWithWork runs workIterations of fixed CPU work before answering
+// (0 = none, the default behaviour).
+func StateHandlerWithWork(engine StressEngine, workIterations int) http.HandlerFunc {
+	return stateHandlerWithWork(engine, telemetry.Logger, workIterations)
 }
 
 func stateHandler(engine StressEngine, logger *slog.Logger) http.HandlerFunc {
+	return stateHandlerWithWork(engine, logger, 0)
+}
+
+func stateHandlerWithWork(engine StressEngine, logger *slog.Logger, workIterations int) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		ctx := r.Context()
 		_, span := tracer.Start(ctx, "GET /api/state")
 		defer span.End()
+
+		if workIterations > 0 {
+			sum := chainedSHA256(workIterations)
+			workSink.Store(uint32(sum[0]))
+		}
 
 		level := engine.GetLevel()
 		workers := engine.GetWorkers()
