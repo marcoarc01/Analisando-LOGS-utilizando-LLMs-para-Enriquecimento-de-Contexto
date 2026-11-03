@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/sha256"
 	"sync/atomic"
 )
@@ -16,4 +17,23 @@ func chainedSHA256(iterations int) [sha256.Size]byte {
 		sum = sha256.Sum256(sum[:])
 	}
 	return sum
+}
+
+// workCheckBlock is how many hashes run between two context checks: about 0.2 ms
+// of work, so a check (tens of nanoseconds) costs well under 0.1% of it.
+const workCheckBlock = 4096
+
+// chainedSHA256Ctx is chainedSHA256 that stops between blocks of workCheckBlock
+// iterations once ctx is done, returning ctx.Err().
+func chainedSHA256Ctx(ctx context.Context, iterations int) ([sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	for i := 0; i < iterations; i++ {
+		if i%workCheckBlock == 0 {
+			if err := ctx.Err(); err != nil {
+				return sum, err
+			}
+		}
+		sum = sha256.Sum256(sum[:])
+	}
+	return sum, nil
 }

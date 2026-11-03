@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/marcoarc01/Analisando-LOGS-utilizando-LLMs-para-Enriquecimento-de-Contexto/stresser-app/telemetry"
@@ -26,6 +27,26 @@ type StateResponse struct {
 }
 
 var correlationIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+
+// DeadlineHeader carries the caller's remaining budget for this request in whole
+// milliseconds: a relative duration, as grpc-timeout, never an absolute time.
+// It is optional; without a valid value the handler behaves as before.
+const DeadlineHeader = "X-Request-Timeout-Ms"
+
+var deadlinePattern = regexp.MustCompile(`^[0-9]{1,7}$`)
+
+// requestBudget parses DeadlineHeader: a positive integer of milliseconds.
+func requestBudget(r *http.Request) (time.Duration, bool) {
+	value := r.Header.Get(DeadlineHeader)
+	if !deadlinePattern.MatchString(value) {
+		return 0, false
+	}
+	ms, err := strconv.Atoi(value)
+	if err != nil || ms <= 0 {
+		return 0, false
+	}
+	return time.Duration(ms) * time.Millisecond, true
+}
 
 func StateHandler(engine StressEngine) http.HandlerFunc {
 	return StateHandlerWithWork(engine, 0)
@@ -48,9 +69,25 @@ func stateHandlerWithWork(engine StressEngine, logger *slog.Logger, workIteratio
 		_, span := tracer.Start(ctx, "GET /api/state")
 		defer span.End()
 
+		// With a budget, the deadline counts from the moment the request arrived and
+		// the work stops cooperatively once it passes (or the client goes away).
+		work := ctx
+		budget, hasBudget := requestBudget(r)
+		if hasBudget {
+			var cancel context.CancelFunc
+			work, cancel = context.WithDeadline(ctx, started.Add(budget))
+			defer cancel()
+		}
+
 		if workIterations > 0 {
-			sum := chainedSHA256(workIterations)
-			workSink.Store(uint32(sum[0]))
+			if hasBudget {
+				if sum, err := chainedSHA256Ctx(work, workIterations); err == nil {
+					workSink.Store(uint32(sum[0]))
+				}
+			} else {
+				sum := chainedSHA256(workIterations)
+				workSink.Store(uint32(sum[0]))
+			}
 		}
 		// The client may have given up (for instance on its own timeout) while the
 		// work ran: record that instead of answering a request nobody waits for.
@@ -62,6 +99,20 @@ func stateHandlerWithWork(engine StressEngine, logger *slog.Logger, workIteratio
 				"error", reason,
 			}, correlationFields(r)...)
 			logger.WarnContext(ctx, "State request canceled", fields...)
+			return
+		}
+		// The caller's budget ran out: stop here and answer 504.
+		if hasBudget && errors.Is(work.Err(), context.DeadlineExceeded) {
+			fields := append([]any{
+				"event", "state_request_deadline_exceeded",
+				"method", r.Method,
+				"route", "/api/state",
+				"error", "context deadline exceeded",
+			}, correlationFields(r)...)
+			logger.WarnContext(ctx, "State request deadline exceeded", fields...)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGatewayTimeout)
+			w.Write([]byte(`{"error": "deadline exceeded"}` + "\n"))
 			return
 		}
 

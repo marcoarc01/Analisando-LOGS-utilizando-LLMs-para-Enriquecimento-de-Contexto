@@ -1,4 +1,5 @@
 import logging
+import math
 import time
 
 import httpx
@@ -18,6 +19,12 @@ TRACE_EVENTS = {
 # not finish (h11 states not DONE), i.e. after a failure. Its own "close" trace is
 # emitted without a request, so it never reaches this callback.
 CLOSED_AFTER_FAILURE = "http11.response_closed.complete"
+# Deadline propagation: the remaining lookup budget in whole milliseconds, as a
+# relative duration (grpc-timeout semantics, not an absolute time). The value is
+# recomputed at the moment httpcore is about to write the request headers, so
+# pool waits and connection set-up count as time already spent.
+DEADLINE_HEADER = "X-Request-Timeout-Ms"
+SEND_HEADERS = "http11.send_request_headers.started"
 
 
 class StresserUnavailable(Exception):
@@ -49,6 +56,12 @@ class StresserClient:
             else None
         )
         self.logger: logging.Logger | None = None
+        self.timeout_ms = settings.stresser_timeout_seconds * 1000
+
+    def _budget_ms(self, lookup_started_ns: int) -> int:
+        """Configured timeout minus the time spent since the lookup started (at least 1 ms)."""
+        spent_ms = (time.perf_counter_ns() - lookup_started_ns) / 1e6
+        return max(1, math.floor(self.timeout_ms - spent_ms))
 
     def _emit(self, event: str, fields: dict, level: int = logging.INFO, **extra) -> None:
         if self.logger is not None:
@@ -56,7 +69,15 @@ class StresserClient:
 
     def _tracer(self, fields: dict, state: dict):
         async def trace(name: str, info: dict) -> None:
-            if name.endswith(".failed"):
+            if name == SEND_HEADERS:
+                request = info.get("request")
+                if request is not None:
+                    value = str(self._budget_ms(state["started"])).encode("ascii")
+                    request.headers = [
+                        (key, value if key.lower() == DEADLINE_HEADER.lower().encode("ascii") else item)
+                        for key, item in request.headers
+                    ]
+            elif name.endswith(".failed"):
                 if not state["failed"]:
                     state["failed"] = True
                     error = type(info.get("exception")).__name__
@@ -77,6 +98,7 @@ class StresserClient:
     async def get_level(
         self, *, request_id: str | None = None, experiment_run_id: str | None = None
     ) -> int:
+        lookup_started = time.perf_counter_ns()
         headers = {}
         if request_id:
             headers["X-Request-ID"] = request_id
@@ -85,7 +107,8 @@ class StresserClient:
         fields = {"request_id": request_id}
         if experiment_run_id:
             fields["experiment_run_id"] = experiment_run_id
-        state = {"failed": False}
+        state = {"failed": False, "started": lookup_started}
+        headers[DEADLINE_HEADER] = str(self._budget_ms(lookup_started))
         try:
             started = time.perf_counter_ns()
             try:

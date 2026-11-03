@@ -1,6 +1,6 @@
 """Real-CPU pilots: orchestrator test runs on the main docker-compose.yml, plus CPU sampling and analysis.
 
-run:     --conditions (default baseline, cpu75, cpu80, cpu92) once each, phases --phases (default 30/60/30),
+run:     --conditions (default baseline, cpu92, cpu100) once each, phases --phases (default 30/60/30),
          outputs under --output. Every (re)created container must match what `docker compose config` renders
          for it: no cpuset, the CPU quota, and the CHECKED_ENV variables (--expect-env adds more).
 analyze: per condition and phase measurements written to <output>/analysis.json. The latency reference is the
@@ -23,7 +23,9 @@ from pathlib import Path
 import exporter
 import orchestrator as o
 
-CONDITIONS = ("baseline", "cpu75", "cpu80", "cpu92")
+CONDITIONS = ("baseline", "cpu92", "cpu100")
+# Analysis order; the earlier pilots used cpu75/cpu80, which left the catalog in B12.
+ANALYSIS_ORDER = ("baseline", "cpu50", "cpu75", "cpu80", "cpu92", "cpu100")
 PHASES = (30, 60, 30)
 SERVICES = ("application-api", "stresser-app")
 CHECKED_ENV = {"application-api": ("DEGRADATION_POLICY", "REQUEST_WORK_ITERATIONS", "STRESSER_TIMEOUT_SECONDS"),
@@ -294,7 +296,8 @@ def analyze(output):
         p99 = statistics.quantiles(reference, n=100, method="inclusive")[98]
         result = {"reference": "normal_1 phase of every run, excluding 404/422",
                   "reference_p99_latency_ms": p99, "reference_p99_requests": len(reference), "conditions": {}}
-    for condition in [c for c in o.CONDITIONS if c in runs]:
+    order = ANALYSIS_ORDER + tuple(c for c in o.CONDITIONS if c not in ANALYSIS_ORDER)
+    for condition in [c for c in order if c in runs]:
         record, finals, go, measurement = runs[condition]
         t0, phases = bounds(record)
         summary = record["k6"]["summary"] or {}

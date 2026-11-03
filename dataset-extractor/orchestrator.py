@@ -20,7 +20,7 @@ from pathlib import Path
 
 import exporter
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 REPO = Path(__file__).resolve().parents[1]
 DATA_ROOT = Path(r"C:\tcc-data")
 # Dataset v2 official collection in official-v2; C:\tcc-data\official is the v1 collection and is never written.
@@ -128,16 +128,17 @@ class Condition:
 
 
 # Names say which fault, never its size: the network values follow the lookup timeout (NETWORK_RULE).
+# Dataset v2 grid (B12, approved): CPU alone at 92 and 100 (cpu75/cpu80 left no error or text trace in B10),
+# the slow and the timeout network, and CPU + slow network at 75, 92 and 100.
 CONDITIONS = {c.name: c for c in (
     Condition("baseline", 0, None, "baseline"),
-    Condition("cpu75", 75, None, "stress_cpu"),
-    Condition("cpu80", 80, None, "stress_cpu"),
     Condition("cpu92", 92, None, "stress_cpu"),
+    Condition("cpu100", 100, None, "stress_cpu"),
     Condition("net_slow", 0, 0.25, "network_latency"),
     Condition("net_timeout", 0, 1.25, "network_timeout"),
     Condition("cpu75_net_slow", 75, 0.25, "combined"),
-    Condition("cpu80_net_slow", 80, 0.25, "combined"),
     Condition("cpu92_net_slow", 92, 0.25, "combined"),
+    Condition("cpu100_net_slow", 100, 0.25, "combined"),
 )}
 OFFICIAL_REPETITIONS = {name: 15 if name == "baseline" else 5 for name in CONDITIONS}
 

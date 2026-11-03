@@ -20,29 +20,31 @@ TIMEOUT_MS = 303
 class CatalogTest(unittest.TestCase):
     def test_fixed_catalog(self):
         expected = {
-            "baseline": (0, None, "baseline"), "cpu75": (75, None, "stress_cpu"),
-            "cpu80": (80, None, "stress_cpu"), "cpu92": (92, None, "stress_cpu"),
+            "baseline": (0, None, "baseline"), "cpu92": (92, None, "stress_cpu"),
+            "cpu100": (100, None, "stress_cpu"),
             "net_slow": (0, 0.25, "network_latency"), "net_timeout": (0, 1.25, "network_timeout"),
-            "cpu75_net_slow": (75, 0.25, "combined"), "cpu80_net_slow": (80, 0.25, "combined"),
-            "cpu92_net_slow": (92, 0.25, "combined"),
+            "cpu75_net_slow": (75, 0.25, "combined"), "cpu92_net_slow": (92, 0.25, "combined"),
+            "cpu100_net_slow": (100, 0.25, "combined"),
         }
         self.assertEqual({n: (c.stress_level, c.toxic_timeout_factor, c.k6_scenario)
                           for n, c in o.CONDITIONS.items()}, expected)
         self.assertTrue({c.k6_scenario for c in o.CONDITIONS.values()} <= K6_TAGS)
-        for removed in ("cpu30", "cpu50", "net_latency500", "net_timeout2500", "cpu75_lat500"):
+        self.assertEqual(list(o.CONDITIONS), list(expected))
+        for removed in ("cpu30", "cpu50", "cpu75", "cpu80", "cpu80_net_slow", "net_latency500", "net_timeout2500",
+                        "cpu75_lat500"):
             self.assertNotIn(removed, o.CONDITIONS)
         for name in o.CONDITIONS:
-            self.assertFalse(any(ch.isdigit() for ch in name.replace("cpu75", "").replace("cpu80", "")
+            self.assertFalse(any(ch.isdigit() for ch in name.replace("cpu100", "").replace("cpu75", "")
                                  .replace("cpu92", "")), name)
 
     def test_toxic_definition_follows_the_timeout(self):
-        for name in ("baseline", "cpu75", "cpu80", "cpu92"):
+        for name in ("baseline", "cpu92", "cpu100"):
             self.assertIsNone(o.CONDITIONS[name].toxic(TIMEOUT_MS))
             self.assertFalse(o.CONDITIONS[name].has_toxic)
         self.assertEqual(o.CONDITIONS["net_timeout"].toxic(TIMEOUT_MS), {
             "name": "intervention", "type": "latency", "stream": "downstream", "toxicity": 1.0,
             "attributes": {"latency": 379, "jitter": 57}})
-        for name in ("net_slow", "cpu75_net_slow", "cpu80_net_slow", "cpu92_net_slow"):
+        for name in ("net_slow", "cpu75_net_slow", "cpu92_net_slow", "cpu100_net_slow"):
             self.assertEqual(o.CONDITIONS[name].toxic(TIMEOUT_MS)["attributes"], {"latency": 76, "jitter": 11})
         # The v1 values come back with the v1 timeout of 2 s.
         self.assertEqual(o.CONDITIONS["net_slow"].toxic_values(2000), (500, 75))
@@ -64,10 +66,10 @@ class SeedTest(unittest.TestCase):
         self.assertEqual(seeds, {(c, r): o.derive_seed(c, r) for c in o.CONDITIONS for r in range(1, 16)})
         self.assertEqual(len(set(seeds.values())), len(seeds))
         self.assertTrue(all(1 <= s < 2**31 for s in seeds.values()))
-        self.assertEqual(len({o.derive_seed(c, r) for c, r in o.official_plan(1)}), 55)
+        self.assertEqual(len({o.derive_seed(c, r) for c, r in o.official_plan(1)}), 50)
 
     def test_rejects_unknown(self):
-        for args in (("free-input", 1), ("cpu50", 1), ("cpu75", 0)):
+        for args in (("free-input", 1), ("cpu50", 1), ("cpu80", 1), ("cpu92", 0)):
             with self.assertRaises(ValueError):
                 o.derive_seed(*args)
             with self.assertRaises(ValueError):
@@ -77,8 +79,8 @@ class SeedTest(unittest.TestCase):
         seeds = {(c, r): o.derive_k6_seed(c, r) for c in o.CONDITIONS for r in range(1, 16)}
         self.assertEqual(len(set(seeds.values())), len(seeds))
         self.assertTrue(all(0 <= s < 2**32 for s in seeds.values()))
-        digest = o.hashlib.sha256(b"tcc-k6-seed-v1:cpu80:3").hexdigest()
-        self.assertEqual(o.derive_k6_seed("cpu80", 3), int(digest[:8], 16))
+        digest = o.hashlib.sha256(b"tcc-k6-seed-v1:cpu100:3").hexdigest()
+        self.assertEqual(o.derive_k6_seed("cpu100", 3), int(digest[:8], 16))
 
 
 class ScheduleTest(unittest.TestCase):
@@ -99,9 +101,9 @@ class ScheduleTest(unittest.TestCase):
                                  (start, start + 120, "360s"))
                 self.assertTrue(60 <= start <= 180)
         with self.assertRaises(ValueError):
-            o.phase_schedule("official", [120, 120, 120], "cpu75", 1)
+            o.phase_schedule("official", [120, 120, 120], "cpu92", 1)
         with self.assertRaises(ValueError):
-            o.phase_schedule("official", None, "cpu75", 6)
+            o.phase_schedule("official", None, "cpu92", 6)
         self.assertIsNone(o.phase_schedule("test")["start_offset"])
 
     def test_start_offsets_are_stratified(self):
@@ -114,8 +116,8 @@ class ScheduleTest(unittest.TestCase):
                 self.assertTrue(lo <= x["start_offset_s"] < hi or (x["stratum"] == strata and x["start_offset_s"] == 180))
                 self.assertEqual(x["stratum_seconds"][0], o.math.ceil(lo))
             self.assertEqual(offsets, [o.start_offset(condition, r) for r in range(1, strata + 1)])
-        order = [o.start_offset("cpu75", r)["stratum"] for r in range(1, 6)]
-        self.assertNotEqual(order, [o.start_offset("cpu80", r)["stratum"] for r in range(1, 6)])
+        order = [o.start_offset("cpu92", r)["stratum"] for r in range(1, 6)]
+        self.assertNotEqual(order, [o.start_offset("cpu100", r)["stratum"] for r in range(1, 6)])
         self.assertEqual(o.start_offset("baseline", 15)["strata"], 15)
 
     def test_invalid_phases(self):
@@ -141,8 +143,8 @@ class NamesTest(unittest.TestCase):
 def sample_record(status="valid"):
     return {
         "orchestrator_version": o.VERSION, "experiment_run_id": RUN_ID, "condition": "cpu80_lat500",
-        "condition_params": o.CONDITIONS["cpu80_net_slow"].params(TIMEOUT_MS), "repetition": 1, "mode": "test",
-        "seed": o.derive_seed("cpu80_net_slow", 1), "git": {"commit": "a" * 40, "dirty": True, "porcelain": [" M x"]},
+        "condition_params": o.CONDITIONS["cpu92_net_slow"].params(TIMEOUT_MS), "repetition": 1, "mode": "test",
+        "seed": o.derive_seed("cpu92_net_slow", 1), "git": {"commit": "a" * 40, "dirty": True, "porcelain": [" M x"]},
         "batch": None, "phases_seconds": [30, 30, 30], "k6_duration": "90s", "k6_seed": 1, "start_offset": None,
         "schedule": {"t0_utc": "2026-10-15T00:00:00.000000000Z"},
         "phase_boundaries_utc": {"intervention_start": "a", "intervention_end": "b"},
@@ -313,6 +315,17 @@ class ExporterTest(unittest.TestCase):
         self.assertTrue(corr["one_to_one"])
         self.assertEqual((corr["go_state_queried"], corr["go_state_request_canceled"]), (1, 1))
 
+    def test_go_deadline_exceeded_counts_as_the_lookup_record(self):
+        lines = [l for l in self.lines() if '"r2"' not in l or "application-api" in l]
+        lines.append(event("2026-10-15T00:00:01.500Z", "stresser-app", "r2", event="state_request_deadline_exceeded",
+                           error="context deadline exceeded"))
+        corr = exporter.correlation(self.rows(lines))
+        self.assertTrue(corr["one_to_one"])
+        self.assertEqual((corr["go_state_queried"], corr["go_state_request_deadline_exceeded"]), (1, 1))
+        lines.append(event("2026-10-15T00:00:01.600Z", "stresser-app", "r2", event="state_request_canceled",
+                           error="context canceled"))
+        self.assertFalse(exporter.correlation(self.rows(lines))["one_to_one"])
+
     def test_lookup_without_any_go_record_or_with_two_breaks_correlation(self):
         missing = [l for l in self.lines() if not ('"r2"' in l and "stresser-app" in l)]
         self.assertFalse(exporter.correlation(self.rows(missing))["one_to_one"])
@@ -352,8 +365,8 @@ class BatchTest(unittest.TestCase):
 class OfficialPlanTest(unittest.TestCase):
     def test_items_and_counts(self):
         plan = o.official_plan(202610160)
-        self.assertEqual(len(plan), 55)
-        self.assertEqual(len(set(plan)), 55)
+        self.assertEqual(len(plan), 50)
+        self.assertEqual(len(set(plan)), 50)
         expected = {("baseline", r) for r in range(1, 16)} | {
             (c, r) for c in o.CONDITIONS if c != "baseline" for r in range(1, 6)}
         self.assertEqual(set(plan), expected)
@@ -366,17 +379,17 @@ class OfficialPlanTest(unittest.TestCase):
 
     def test_official_items_only(self):
         o.check_official_items(o.official_plan(1))
-        for item in (("baseline", 16), ("cpu75", 6)):
+        for item in (("baseline", 16), ("cpu92", 6)):
             with self.assertRaises(ValueError):
                 o.check_official_items([item])
 
     def test_blocks(self):
         plan = list(enumerate(o.official_plan(1), 1))
         blocks = o.split_blocks(plan, 5)
-        self.assertEqual([len(b) for b in blocks], [11] * 5)
+        self.assertEqual([len(b) for b in blocks], [10] * 5)
         self.assertEqual([item for block in blocks for item in block], plan)
-        self.assertEqual([len(b) for b in o.split_blocks(plan, 4)], [14, 14, 14, 13])
-        for count in (0, 56):
+        self.assertEqual([len(b) for b in o.split_blocks(plan, 4)], [13, 13, 12, 12])
+        for count in (0, 51):
             with self.assertRaises(ValueError):
                 o.split_blocks(plan, count)
 
@@ -441,10 +454,10 @@ class ResumeTest(unittest.TestCase):
         run_id = self.add_run(*skipped[1])
         code, text = self.main("--dry-run")
         self.assertEqual(code, 0)
-        self.assertIn("runs=55", text)
+        self.assertIn("runs=50", text)
         self.assertEqual(sum(line.startswith("block ") and "positions" in line for line in text.splitlines()), 5)
         self.assertIn(f"skip position {skipped[0]} {skipped[1][0]}#{skipped[1][1]}: already valid (run {run_id})", text)
-        self.assertIn("block 1/5: to run=10 skipped=1", text)
+        self.assertIn("block 1/5: to run=9 skipped=1", text)
         self.assertIn("dry-run: nothing executed", text)
         self.assertIn("lookup_timeout_ms=303", text)
         first = self.block[0][1]
@@ -469,7 +482,7 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual([item for item, _ in calls], expected)
         positions = [p for i, (p, _) in enumerate(self.block) if i not in (0, 5)]
         self.assertEqual([b["position"] for _, b in calls], positions)
-        self.assertTrue(all(b["block"] == "1/5" and b["total"] == 55 and b["seed"] == 202610160 for _, b in calls))
+        self.assertTrue(all(b["block"] == "1/5" and b["total"] == 50 and b["seed"] == 202610160 for _, b in calls))
         self.assertEqual(len({b["id"] for _, b in calls}), 1)
 
     def test_block_already_complete(self):
@@ -527,7 +540,7 @@ class OutputDirTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             o.phase_schedule("validation", [20, 20, 20], "baseline", 1)
         with self.assertRaises(ValueError):
-            o.check_official_items([("cpu75", 6)])
+            o.check_official_items([("cpu92", 6)])
         out = io.StringIO()
         with mock.patch.object(o, "lookup_timeout_ms", lambda: TIMEOUT_MS), contextlib.redirect_stdout(out):
             code = o.main(["run", "--mode", "validation", "--condition", "net_slow", "--repetition", "1", "--dry-run"])

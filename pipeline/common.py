@@ -11,14 +11,16 @@ CONDITIONS_V1 = (
     "baseline", "cpu75", "cpu80", "cpu92", "net_latency500", "net_timeout2500",
     "cpu75_lat500", "cpu80_lat500", "cpu92_lat500",
 )
-# Dataset v2: network conditions named after the fault, their values follow the lookup timeout.
+# Dataset v2 (B12 grid): network conditions named after the fault, their values follow the lookup timeout.
 CONDITIONS_V2 = (
-    "baseline", "cpu75", "cpu80", "cpu92", "net_slow", "net_timeout",
-    "cpu75_net_slow", "cpu80_net_slow", "cpu92_net_slow",
+    "baseline", "cpu92", "cpu100", "net_slow", "net_timeout",
+    "cpu75_net_slow", "cpu92_net_slow", "cpu100_net_slow",
 )
+# Names used only by the v2 pilots (B10 validation and CPU level tests), still forbidden in model inputs.
+CONDITIONS_V2_PILOTS = ("cpu50", "cpu75", "cpu80", "cpu50_net_slow", "cpu80_net_slow")
 CONDITIONS = CONDITIONS_V1
 # Every condition name of any dataset, for the checks that no name leaks into model inputs.
-CONDITION_NAMES = tuple(dict.fromkeys(CONDITIONS_V1 + CONDITIONS_V2))
+CONDITION_NAMES = tuple(dict.fromkeys(CONDITIONS_V1 + CONDITIONS_V2 + CONDITIONS_V2_PILOTS))
 
 
 class PipelineError(Exception):

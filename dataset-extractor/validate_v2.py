@@ -42,24 +42,27 @@ CONTROL_FIELDS = ("status_code", "latency_ms", "timestamp", "request_id", "exper
 LEVELS = {"warn": "warning"}
 LEAK_WORDS = ("stress", "toxic", "experimental", "latency_injected", "localhost", "toxiproxy", "http", "://",
               "www.", ".com", "otel", "loki", "prometheus")
-CPU_LEVELS = (75, 80, 92)
+# CPU levels with both the CPU-alone and the CPU + slow network condition in the catalog (B12: 92 and 100).
+CPU_LEVELS = tuple(c.stress_level for n, c in o.CONDITIONS.items()
+                   if c.k6_scenario == "stress_cpu" and f"{n}_net_slow" in o.CONDITIONS)
 
 
 # ---------------------------------------------------------------------------------------------------- run
 
-def run(conditions):
-    if OUTPUT.exists():
-        print(f"ERROR: refusing to overwrite existing output: {OUTPUT}", file=sys.stderr)
+def run(conditions, mode=MODE):
+    output = o.DATA_ROOT / o.MODE_DIRS[mode]
+    if output.exists():
+        print(f"ERROR: refusing to overwrite existing output: {output}", file=sys.stderr)
         return 1
     expected = pilot.expected_config()
     pilot.check_config(pilot.container_ids(), expected)
     timeout_ms = o.lookup_timeout_ms()
     state = {"expected": expected, "expected_gomaxprocs": pilot.expected_gomaxprocs(expected)}
     pilot.instrument(state)
-    print(o.describe_plan([(c, 1) for c in conditions], MODE, None, None, timeout_ms), flush=True)
+    print(o.describe_plan([(c, 1) for c in conditions], mode, None, None, timeout_ms), flush=True)
     for condition in conditions:
         try:
-            record = o.run_one(condition, 1, MODE, None, None, timeout_ms=timeout_ms)
+            record = o.run_one(condition, 1, mode, None, None, timeout_ms=timeout_ms)
         except (o.PrecheckError, o.InfraError) as error:
             print(f"STOP at {condition}: {error}", file=sys.stderr)
             return 1
@@ -67,7 +70,7 @@ def run(conditions):
                        "readings": state["readings"], "docker_stats": state["sampler"].samples,
                        "compose": "docker-compose.yml", "go_gomaxprocs": state["gomaxprocs"],
                        "validity": record["validity"]}
-        o.write_new(OUTPUT / "measurements" / f"{record['experiment_run_id']}.json",
+        o.write_new(output / "measurements" / f"{record['experiment_run_id']}.json",
                     (json.dumps(measurement, indent=2) + "\n").encode("utf-8"))
         if record["validity"]["status"] != "valid":
             print(f"NOTE at {condition}: run invalid {record['validity']['reasons']}", file=sys.stderr)
