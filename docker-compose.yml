@@ -60,9 +60,8 @@ services:
       - STRESS_MODE=duty
       # GOMAXPROCS igual a cota de CPU (o runtime do Go faz isso sozinho a partir do 1.25).
       - GOMAXPROCS=1
-      # 50% de 1 CPU com a carga normal do k6 (meta do exemplo oficial do HPA do Kubernetes): 49,95% em 180 s
-      # (recalibrado em 2026-11-01 com os logs intermediarios e o jitter).
-      - STATE_WORK_ITERATIONS=${STATE_WORK_ITERATIONS:-1222000}
+      # 50% de 1 CPU com a carga normal do k6 (meta do exemplo oficial do HPA do Kubernetes).
+      - STATE_WORK_ITERATIONS=${STATE_WORK_ITERATIONS:-931000}
     restart: unless-stopped
     # Cota de 1 CPU, como limits.cpu do Kubernetes; sem cpuset.
     deploy:
