@@ -1,6 +1,12 @@
 import collections
+import contextlib
+import io
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
+import orchestrator as o
 import validate_v2 as v
 
 GO = {"timestamp": "2026-11-01T14:15:05.980667482Z", "level": "info", "message": "state queried",
@@ -51,6 +57,52 @@ class MaskTest(unittest.TestCase):
     def test_distinct_vectors(self):
         a, b = collections.Counter({"x": 2, "y": 1}), collections.Counter({"y": 1, "x": 2})
         self.assertEqual(v.distinct_vectors([a, b, collections.Counter({"x": 3})]), 2)
+
+
+class RunGuardTest(unittest.TestCase):
+    def run_with(self, root, run_guard, run_one=None):
+        pilot = mock.Mock()
+        pilot.expected_config.return_value = {}
+        pilot.expected_gomaxprocs.return_value = 1
+        with mock.patch.object(v, "pilot", pilot), mock.patch.object(o, "DATA_ROOT", root), \
+                mock.patch.object(o, "lookup_timeout_ms", lambda: 292), mock.patch.object(o, "run_guard", run_guard), \
+                mock.patch.object(o, "run_one", run_one), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return v.run(["baseline"]), pilot
+
+    def test_refused_guard_runs_nothing_and_can_be_repeated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / o.MODE_DIRS["validation"]
+            (output / "control").mkdir(parents=True)
+            (output / "control" / "guard-x.json").write_text("{}", encoding="utf-8")
+            code, pilot = self.run_with(root, lambda out, check: (None, o.GUARD_REFUSED_EXIT))
+            self.assertEqual(code, o.GUARD_REFUSED_EXIT)
+            pilot.instrument.assert_not_called()
+
+    def test_existing_runs_are_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / o.MODE_DIRS["validation"]
+            (output / "control").mkdir(parents=True)
+            (output / "control" / "runs.csv").write_text("x\n", encoding="utf-8")
+            code, _ = self.run_with(root, lambda out, check: self.fail("no warm-up over an existing collection"))
+            self.assertEqual(code, 1)
+
+    def test_guard_runs_before_the_instrumentation_and_goes_to_the_run(self):
+        seen, instrumented = [], []
+
+        def run_one(condition, repetition, mode, phases, batch, timeout_ms=None, guard=None):
+            seen.append(guard)
+            raise o.InfraError("stop here")
+
+        def run_guard(out, check):
+            instrumented.append(v.pilot.instrument.called)
+            return {"guard_id": "g"}, 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _ = self.run_with(Path(tmp), run_guard, run_one)
+        self.assertEqual((code, seen, instrumented), (1, [{"guard_id": "g"}], [False]))
 
 
 if __name__ == "__main__":

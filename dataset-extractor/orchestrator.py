@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import re
 import signal
 import subprocess
 import sys
@@ -20,7 +21,7 @@ from pathlib import Path
 
 import exporter
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 REPO = Path(__file__).resolve().parents[1]
 DATA_ROOT = Path(r"C:\tcc-data")
 # Dataset v2 official collection in official-v2; C:\tcc-data\official is the v1 collection and is never written.
@@ -63,6 +64,24 @@ PROXY = "stresser"
 TOXIC_NAME = "intervention"
 K6_LOCK = "observability-k6-run"
 INGESTION_WAIT_SECONDS = 15
+# Services whose image docker-compose.yml fixes by digest; every run must use exactly these images.
+PINNED_SERVICES = ("stresser-app", "application-api")
+# Calibration reference of the frozen Go image (B13, 931000 iterations, 5 min of baseline): 62.1 ms of Go CPU per
+# lookup and 49.8% of its 1 CPU. Records in C:\tcc-data\pilot\recalibration-20261103.
+GO_CPU_MS_PER_LOOKUP = 62.1
+GO_CPU_MS_TOLERANCE = 5.0
+GO_CPU_PERCENT_RANGE = (45.0, 55.0)
+# The 292 ms timeout is the p99.9 of the lookup (B13), so about 0.1% of the baseline lookups time out by design and
+# "no timeout" is not a criterion. This is only a safety limit, 10 times the expected rate.
+GUARD_MAX_TIMEOUT_RATE = 0.01
+GUARD_SECONDS = 120
+GUARD_REFUSED_EXIT = 3
+GUARD_SEED_NAMESPACE = "tcc-calibration-guard-v1"
+# Go CPU windows leave out the k6 start and end, as calibrate_cpu_prod.py (B13). The last reading of the normal phase
+# comes this early so that it never delays the injection.
+CPU_SKIP_S = 15
+CPU_TAIL_S = 5
+CPU_READ_LEAD_S = 2
 RUNS_COLUMNS = [
     "experiment_run_id", "condition", "repetition", "mode", "seed", "commit", "dirty",
     "batch_id", "batch_seed", "batch_position", "t0_utc", "intervention_start_utc",
@@ -91,6 +110,10 @@ class PrecheckError(Exception):
 
 
 class InfraError(Exception):
+    pass
+
+
+class CalibrationGuardError(Exception):
     pass
 
 
@@ -208,6 +231,92 @@ def lookup_timeout_ms(runner=None):
     return round(float(value) * 1000)
 
 
+def pinned_images(runner=None):
+    """Digest of each PINNED_SERVICES image in `docker compose config`; an image without a digest is refused."""
+    services = json.loads((runner or sh)(["docker", "compose", "config", "--format", "json"]).stdout)["services"]
+    pinned = {}
+    for service in PINNED_SERVICES:
+        image = services[service].get("image", "")
+        digest = image.partition("@")[2]
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise PrecheckError(f"{service}: docker-compose.yml must fix the image by digest, found {image!r}")
+        pinned[service] = digest
+    return pinned
+
+
+def service_container(service, runner=None):
+    container = (runner or sh)(["docker", "compose", "ps", "-q", service]).stdout.strip()
+    if not container:
+        raise PrecheckError(f"{service} has no running container")
+    return container
+
+
+def running_images(runner=None):
+    return {service: (runner or sh)(["docker", "inspect", "--format", "{{.Image}}",
+                                     service_container(service, runner)]).stdout.strip()
+            for service in PINNED_SERVICES}
+
+
+def check_images(pinned, running):
+    different = [f"{s}: running {running.get(s)}, pinned {pinned[s]}" for s in pinned if running.get(s) != pinned[s]]
+    if different:
+        raise PrecheckError("running image differs from docker-compose.yml:\n  " + "\n  ".join(different))
+
+
+def verified_images():
+    pinned, running = pinned_images(), running_images()
+    check_images(pinned, running)
+    return {"pinned": pinned, "running": running}
+
+
+def read_go_cpu(container):
+    """Accumulated CPU of the Go cgroup; the time is the middle of the docker exec."""
+    started = time.time_ns()
+    out = sh(["docker", "exec", container, "cat", "/sys/fs/cgroup/cpu.stat"], timeout=30).stdout
+    ended = time.time_ns()
+    stat = dict(line.split() for line in out.splitlines())
+    return {"utc_ns": (started + ended) // 2, "usage_usec": int(stat["usage_usec"])}
+
+
+def go_cpu_window(first, last, rows):
+    """Go CPU between two cgroup readings, per lookup (every Go record of a lookup) and as mean use of its 1 CPU."""
+    lookups = sum(first["utc_ns"] <= t < last["utc_ns"] and e["service"] == "stresser-app"
+                  and e.get("event") in exporter.GO_LOOKUP_EVENTS for t, _, e in rows)
+    seconds = (last["utc_ns"] - first["utc_ns"]) / exporter.NS
+    cpu_ms = (last["usage_usec"] - first["usage_usec"]) / 1000
+    return {"start_utc": utc_iso(first["utc_ns"]), "end_utc": utc_iso(last["utc_ns"]), "seconds": round(seconds, 3),
+            "go_lookups": lookups, "go_cpu_ms_per_lookup": round(cpu_ms / lookups, 3) if lookups else None,
+            "go_cpu_percent": round(cpu_ms / (10 * seconds), 2)}
+
+
+def lookup_timeouts(rows):
+    """Lookups that ran out of time: the FastAPI timeout, or the propagated budget that ended in the Go (its 504)."""
+    return len({e.get("request_id") for _, _, e in rows
+                if e.get("event") == "state_request_deadline_exceeded"
+                or (e.get("event") == "stresser_lookup_failed" and "Timeout" in str(e.get("error_type")))})
+
+
+def cpu_per_lookup_reasons(cpu, label):
+    value = cpu["go_cpu_ms_per_lookup"]
+    low, high = GO_CPU_MS_PER_LOOKUP - GO_CPU_MS_TOLERANCE, GO_CPU_MS_PER_LOOKUP + GO_CPU_MS_TOLERANCE
+    if value is None:
+        return [f"{label}: no Go lookup in the CPU window"]
+    if not low <= value <= high:
+        return [f"{label}: Go CPU {value} ms per lookup outside {low:.1f}-{high:.1f} ms"]
+    return []
+
+
+def guard_reasons(cpu, lookups, timeouts):
+    """Why the calibration guard refuses the block; an empty list approves it."""
+    reasons = cpu_per_lookup_reasons(cpu, "guard")
+    low, high = GO_CPU_PERCENT_RANGE
+    if not low <= cpu["go_cpu_percent"] <= high:
+        reasons.append(f"guard: Go CPU use {cpu['go_cpu_percent']}% outside {low:.0f}-{high:.0f}%")
+    if lookups and timeouts / lookups > GUARD_MAX_TIMEOUT_RATE:
+        reasons.append(f"guard: {timeouts} timeouts in {lookups} lookups above {GUARD_MAX_TIMEOUT_RATE:.0%}")
+    return reasons
+
+
 def run_paths(base, run_id):
     uuid.UUID(run_id)
     return {"raw": base / "raw" / f"{run_id}.jsonl",
@@ -288,8 +397,9 @@ def check_git(mode, state):
                             + "\n  ".join(state["porcelain"]))
 
 
-def evaluate_validity(k6, cleanup, corr, duration):
-    reasons = []
+def evaluate_validity(k6, cleanup, corr, duration, pre_injection=None):
+    """pre_injection: Go CPU of the normal phase before the injection; None when the phase was too short to measure."""
+    reasons = cpu_per_lookup_reasons(pre_injection, "pre-injection") if pre_injection else []
     summary = k6.get("summary") or {}
     if k6.get("exit_code") != 0:
         reasons.append(f"k6 exit code {k6.get('exit_code')}")
@@ -429,7 +539,7 @@ def stack_state():
     return state, toxics
 
 
-def precheck(mode):
+def check_stack():
     problems = []
     services = compose_services()
     running = {name for name, item in services.items() if item.get("State") == "running"}
@@ -460,16 +570,22 @@ def precheck(mode):
             problems.append(f"Prometheus target {job} is {health.get(job)}")
     if sh(["docker", "ps", "--filter", f"name={K6_LOCK}", "-q"]).stdout.strip():
         problems.append("another k6 execution is active")
-    git = git_state()
     if problems:
         raise PrecheckError("pre-checks failed:\n  " + "\n  ".join(problems))
+
+
+def precheck(mode):
+    check_stack()
+    git = git_state()
     check_git(mode, git)
     return git
 
 
 def recreate_api(seed, timeout=120, lookup_timeout=None):
     env = {**os.environ, "EXPERIMENT_SEED": str(seed)}
-    sh(["docker", "compose", "up", "-d", "--no-deps", "--force-recreate", "application-api"], env=env, timeout=timeout)
+    # The image comes from the digest of docker-compose.yml: never built and never pulled during a collection.
+    sh(["docker", "compose", "up", "-d", "--no-deps", "--no-build", "--pull", "never", "--force-recreate",
+        "application-api"], env=env, timeout=timeout)
     deadline = time.monotonic() + timeout
     while compose_services().get("application-api", {}).get("Health") != "healthy":
         if time.monotonic() > deadline:
@@ -610,7 +726,83 @@ def _raise_interrupt(signum, frame):
     raise _Interrupted(f"signal {signum}")
 
 
-def run_one(condition_name, repetition, mode, phases=None, batch=None, data_root=DATA_ROOT, timeout_ms=None):
+def calibration_guard(output, check):
+    """Warm-up before a block: GUARD_SECONDS of baseline with no intervention (and no dataset record) and the Go CPU
+    from the cgroup. The result is written to control/guard-<id>.json whatever it is; a refusal raises."""
+    guard_id = str(uuid.uuid4())
+    check()
+    timeout_ms = lookup_timeout_ms()
+    verified_images()
+    seed, k6_seed = _hash_int(GUARD_SEED_NAMESPACE, 12) % (2**31 - 1) + 1, _hash_int(GUARD_SEED_NAMESPACE, 8)
+    log(f"calibration guard {guard_id}: recreating application-api with EXPERIMENT_SEED={seed}")
+    recreate_api(seed, lookup_timeout=timeout_ms)
+    images = verified_images()
+    container = service_container("stresser-app")
+    k6 = K6Process(guard_id, "baseline", f"{GUARD_SECONDS}s", k6_seed)
+    t0, t0_mono = time.time_ns(), time.monotonic()
+    log(f"calibration guard {guard_id}: {GUARD_SECONDS} s of baseline warm-up")
+    k6.start()
+    try:
+        sleep_until(t0_mono + CPU_SKIP_S)
+        first = read_go_cpu(container)
+        sleep_until(t0_mono + GUARD_SECONDS - CPU_TAIL_S)
+        last = read_go_cpu(container)
+        exit_code = k6.wait(timeout=GUARD_SECONDS + 180)
+    finally:
+        if k6.running():
+            k6.stop()
+    k6_end = time.time_ns()
+    time.sleep(INGESTION_WAIT_SECONDS)
+    reasons = [] if exit_code == 0 else [f"guard: k6 exit code {exit_code}"]
+    try:
+        rows, _ = exporter.collect(guard_id, t0, k6_end, loki_url=LOKI_URL)
+    except (exporter.ExportError, OSError) as error:
+        rows = []
+        reasons.append(f"guard: export failed: {type(error).__name__}")
+    cpu = go_cpu_window(first, last, rows)
+    lookups, timeouts = exporter.correlation(rows)["lookup_requests"], lookup_timeouts(rows)
+    reasons += guard_reasons(cpu, lookups, timeouts)
+    summary = k6.summary() or {}
+    result = {
+        "orchestrator_version": VERSION, "guard_id": guard_id, "t0_utc": utc_iso(t0), "k6_end_utc": utc_iso(k6_end),
+        "duration_s": GUARD_SECONDS, "seed": seed, "k6_seed": k6_seed, "lookup_timeout_ms": timeout_ms, "images": images,
+        "limits": {"go_cpu_ms_per_lookup": GO_CPU_MS_PER_LOOKUP, "tolerance_ms": GO_CPU_MS_TOLERANCE,
+                   "go_cpu_percent_range": list(GO_CPU_PERCENT_RANGE), "max_timeout_rate": GUARD_MAX_TIMEOUT_RATE},
+        "go_cpu": cpu, "lookup_requests": lookups, "lookup_timeouts": timeouts,
+        "timeout_rate": round(timeouts / lookups, 6) if lookups else None,
+        "k6": {"exit_code": exit_code, "http_reqs": summary.get("http_reqs"),
+               "dropped_iterations": summary.get("dropped_iterations")},
+        "approved": not reasons, "reasons": reasons,
+    }
+    name = f"control/guard-{guard_id}.json"
+    sha = write_new(output / name, phases_bytes(result))
+    append_manifest(output / "control" / "manifest.sha256", [(sha, name)])
+    log(f"calibration guard {guard_id}: Go {cpu['go_cpu_ms_per_lookup']} ms per lookup, {cpu['go_cpu_percent']}% of "
+        f"1 CPU, {timeouts} timeouts in {lookups} lookups -> {'approved' if not reasons else 'REFUSED'}")
+    if reasons:
+        raise CalibrationGuardError(f"{name}: " + "; ".join(reasons))
+    return result
+
+
+def run_guard(output, check=check_stack):
+    """calibration_guard with the exit codes of main: returns (result, 0), or (None, code) with the reason on stderr."""
+    try:
+        return calibration_guard(guard_output(output), check), 0
+    except CalibrationGuardError as error:
+        print(f"REFUSED by the calibration guard: {error}", file=sys.stderr)
+        return None, GUARD_REFUSED_EXIT
+    except PrecheckError as error:
+        print(f"ABORT before the calibration guard: {error}", file=sys.stderr)
+        return None, 2
+    except InfraError as error:
+        print(f"STOP at the calibration guard (infrastructure): {error}", file=sys.stderr)
+        return None, 1
+    except KeyboardInterrupt:
+        print("interrupted during the calibration guard", file=sys.stderr)
+        return None, 130
+
+
+def run_one(condition_name, repetition, mode, phases=None, batch=None, data_root=DATA_ROOT, timeout_ms=None, guard=None):
     condition = CONDITIONS[condition_name]
     schedule = phase_schedule(mode, phases, condition_name, repetition)
     base = guard_output(data_root / MODE_DIRS[mode])
@@ -626,16 +818,19 @@ def run_one(condition_name, repetition, mode, phases=None, batch=None, data_root
             raise InfraError(f"{paths[key]} already exists")
     log(f"recreating application-api with EXPERIMENT_SEED={seed}")
     recreate_api(seed, lookup_timeout=timeout_ms)
+    images = verified_images()
     state, toxics = stack_state()
     if state != {"stress_level": 0, "cpu_workers": 0} or toxics != []:
         raise InfraError(f"unexpected state after recreation: {state} {toxics}")
+    go_container = service_container("stresser-app")
 
     record = {
         "orchestrator_version": VERSION, "experiment_run_id": run_id, "condition": condition_name,
         "condition_params": condition.params(timeout_ms), "repetition": repetition, "mode": mode, "seed": seed,
         "k6_seed": k6_seed, "k6_seed_rule": K6_SEED_RULE,
         "network_rule": NETWORK_RULE if condition.has_toxic else None,
-        "git": git, "batch": batch, "phases_seconds": schedule["phases_seconds"],
+        "git": git, "images": images, "calibration_guard": guard, "batch": batch,
+        "phases_seconds": schedule["phases_seconds"],
         "start_offset": schedule["start_offset"], "k6_duration": schedule["k6_duration"],
     }
     k6 = K6Process(run_id, condition.k6_scenario, schedule["k6_duration"], k6_seed)
@@ -652,9 +847,15 @@ def run_one(condition_name, repetition, mode, phases=None, batch=None, data_root
         "t0_definition": "launch of load-tests/run.py (k6 container start follows within seconds)",
     }
     exit_code, k6_end = None, None
+    cpu_readings = []
     try:
         log(f"run {run_id}: k6 scenario={condition.k6_scenario} duration={schedule['k6_duration']}")
         k6.start()
+        if schedule["apply_offset_s"] > CPU_SKIP_S + CPU_READ_LEAD_S:
+            sleep_until(t0_mono + CPU_SKIP_S)
+            cpu_readings.append(read_go_cpu(go_container))
+            sleep_until(t0_mono + schedule["apply_offset_s"] - CPU_READ_LEAD_S)
+            cpu_readings.append(read_go_cpu(go_container))
         sleep_until(t0_mono + schedule["apply_offset_s"])
         apply_actions = apply_intervention(condition, timeout_ms)
         log(f"intervention applied: {[a['action'] for a in apply_actions] or 'none (baseline)'}")
@@ -686,7 +887,7 @@ def run_one(condition_name, repetition, mode, phases=None, batch=None, data_root
     record["cleanup"] = clean
     k6_info = {"exit_code": exit_code, "end_utc": utc_iso(k6_end), "summary": k6.summary()}
     record["k6"] = k6_info
-    record["correlation"] = record["export"] = record["measured_effect"] = None
+    record["correlation"] = record["export"] = record["measured_effect"] = record["pre_injection_cpu"] = None
 
     if error is None:
         time.sleep(INGESTION_WAIT_SECONDS)
@@ -701,9 +902,12 @@ def run_one(condition_name, repetition, mode, phases=None, batch=None, data_root
             record["measured_effect"] = exporter.phase_metrics(rows, [
                 ("normal_1", t0 - 10 * exporter.NS, start_ns), ("intervention", start_ns, end_ns),
                 ("normal_2", end_ns, k6_end + 15 * exporter.NS)])
+            if cpu_readings:
+                record["pre_injection_cpu"] = go_cpu_window(*cpu_readings, rows)
         except (exporter.ExportError, OSError) as exc:
             error = exc
-    validity = evaluate_validity(k6_info, clean, record["correlation"], schedule["k6_duration"])
+    validity = evaluate_validity(k6_info, clean, record["correlation"], schedule["k6_duration"],
+                                 record["pre_injection_cpu"])
     if error is not None:
         validity = {"status": "invalid", "reasons": [f"{type(error).__name__}: {error}"] + validity["reasons"]}
     record["validity"] = validity
@@ -750,6 +954,22 @@ def describe_plan(plan, mode, phases, batch_seed=None, timeout_ms=None):
     return "\n".join(lines)
 
 
+def describe_safeguards(mode, pinned):
+    low, high = GO_CPU_MS_PER_LOOKUP - GO_CPU_MS_TOLERANCE, GO_CPU_MS_PER_LOOKUP + GO_CPU_MS_TOLERANCE
+    lines = ["images fixed in docker-compose.yml: " + ", ".join(f"{s} {d}" for s, d in pinned.items()),
+             "each run: the running images must have these digests (recorded in its metadata), else it is refused",
+             f"each run: Go CPU per lookup in the normal phase before the injection outside {low:.1f}-{high:.1f} ms "
+             "marks it invalid (the resume repeats it)"]
+    if mode in DERIVED_MODES:
+        use_low, use_high = GO_CPU_PERCENT_RANGE
+        lines.append(f"calibration guard before the block: {GUARD_SECONDS} s of baseline warm-up; refused (exit code "
+                     f"{GUARD_REFUSED_EXIT}) if Go CPU per lookup is outside {low:.1f}-{high:.1f} ms, Go use outside "
+                     f"{use_low:.0f}-{use_high:.0f}% or timeouts above {GUARD_MAX_TIMEOUT_RATE:.0%} of the lookups")
+    else:
+        lines.append(f"calibration guard: not run in {mode} mode")
+    return "\n".join(lines)
+
+
 def run_minutes(schedule):
     return (schedule["k6_duration_s"] + INGESTION_WAIT_SECONDS + 45) / 60
 
@@ -791,7 +1011,11 @@ def main(argv=None):
     sub.choices["batch"].add_argument("--batch-seed", type=int, required=True)
     sub.choices["plan"].add_argument("--plan-seed", type=int, required=True)
     sub.choices["plan"].add_argument("--block", type=parse_block, required=True, metavar="K/N")
+    guard_only = sub.add_parser("guard", help="only the calibration guard warm-up, no run")
+    guard_only.add_argument("--output", type=Path, required=True, help="directory of control/guard-<id>.json")
     args = parser.parse_args(argv)
+    if args.command == "guard":
+        return run_guard(args.output)[1]
 
     try:
         if args.command == "run":
@@ -804,6 +1028,7 @@ def main(argv=None):
         if args.mode in DERIVED_MODES:
             check_official_items(plan)
         timeout_ms = lookup_timeout_ms()
+        pinned = pinned_images()
         print(describe_plan(plan, args.mode, args.phases, batch_seed, timeout_ms))
         queue = list(enumerate(plan, 1))
         if args.command == "plan":
@@ -814,9 +1039,13 @@ def main(argv=None):
             queue = [(position, item) for position, item in blocks[selected - 1] if item not in done]
     except ValueError as error:
         parser.error(str(error))
-    except InfraError as error:
-        print(f"ABORT: cannot read the lookup timeout from docker compose config: {error}", file=sys.stderr)
+    except PrecheckError as error:
+        print(f"ABORT: {error}", file=sys.stderr)
         return 2
+    except InfraError as error:
+        print(f"ABORT: cannot read docker compose config: {error}", file=sys.stderr)
+        return 2
+    print(describe_safeguards(args.mode, pinned))
     if args.dry_run:
         print("dry-run: nothing executed")
         return 0
@@ -824,6 +1053,11 @@ def main(argv=None):
         print("nothing to run: every item of the block already has a valid run")
         return 0
 
+    guard = None
+    if args.mode in DERIVED_MODES:
+        guard, code = run_guard(DATA_ROOT / MODE_DIRS[args.mode], lambda: precheck(args.mode))
+        if code:
+            return code
     batch_id = str(uuid.uuid4()) if args.command != "run" else None
     for index, (position, (name, rep)) in enumerate(queue, 1):
         batch = {"id": batch_id, "seed": batch_seed, "position": position, "total": len(plan),
@@ -832,7 +1066,7 @@ def main(argv=None):
             batch.update(plan="official", block=f"{selected}/{count}")
         label = f"{index}/{len(queue)} (position {position})"
         try:
-            record = run_one(name, rep, args.mode, args.phases, batch, timeout_ms=timeout_ms)
+            record = run_one(name, rep, args.mode, args.phases, batch, timeout_ms=timeout_ms, guard=guard)
         except PrecheckError as error:
             print(f"ABORT before run {label}: {error}", file=sys.stderr)
             return 2

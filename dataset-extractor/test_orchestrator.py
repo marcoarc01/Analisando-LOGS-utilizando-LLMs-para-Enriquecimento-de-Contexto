@@ -15,6 +15,8 @@ import orchestrator as o
 RUN_ID = "3f1c2e0a-7b6d-4c5e-9f8a-1b2c3d4e5f60"
 K6_TAGS = {"baseline", "stress_cpu", "recovery", "network_latency", "network_timeout", "combined"}
 TIMEOUT_MS = 303
+GO_DIGEST, API_DIGEST = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+PINNED = {"stresser-app": GO_DIGEST, "application-api": API_DIGEST}
 
 
 class CatalogTest(unittest.TestCase):
@@ -442,9 +444,10 @@ class ResumeTest(unittest.TestCase):
         o.append_runs_row(self.base / "control" / "runs.csv", o.runs_row(record))
         self.assertEqual(o.completed_items(self.base, "official", TIMEOUT_MS), {})
 
-    def main(self, *extra, run_one=None):
+    def main(self, *extra, run_one=None, run_guard=lambda output, check: ({"guard_id": "g"}, 0)):
         out = io.StringIO()
         with mock.patch.object(o, "DATA_ROOT", self.root), mock.patch.object(o, "run_one", run_one), \
+                mock.patch.object(o, "run_guard", run_guard), mock.patch.object(o, "pinned_images", lambda: PINNED), \
                 mock.patch.object(o, "lookup_timeout_ms", lambda: TIMEOUT_MS), contextlib.redirect_stdout(out):
             code = o.main(["plan", "--mode", "official", "--plan-seed", "202610160", "--block", "1/5", *extra])
         return code, out.getvalue()
@@ -465,14 +468,19 @@ class ResumeTest(unittest.TestCase):
         line = next(l for l in text.splitlines() if l.lstrip().startswith(f"{self.block[0][0]}. {first[0]} "))
         self.assertIn(f"k6_seed={o.derive_k6_seed(*first)}", line)
         self.assertIn(f"apply=t0+{start}s remove=t0+{start + 120}s", line)
+        self.assertIn(f"images fixed in docker-compose.yml: stresser-app {GO_DIGEST}, application-api {API_DIGEST}", text)
+        self.assertIn("each run: the running images must have these digests", text)
+        self.assertIn("each run: Go CPU per lookup in the normal phase before the injection outside 57.1-67.1 ms", text)
+        self.assertIn("calibration guard before the block: 120 s of baseline warm-up", text)
 
     def test_resume_runs_only_pending_items(self):
         self.add_run(*self.block[0][1])
         self.add_run(*self.block[5][1])
         calls = []
 
-        def run_one(name, rep, mode, phases, batch, timeout_ms=None):
+        def run_one(name, rep, mode, phases, batch, timeout_ms=None, guard=None):
             self.assertEqual(timeout_ms, TIMEOUT_MS)
+            self.assertEqual(guard, {"guard_id": "g"})
             calls.append(((name, rep), batch))
             return {"validity": {"status": "valid", "reasons": []}}
 
@@ -488,9 +496,44 @@ class ResumeTest(unittest.TestCase):
     def test_block_already_complete(self):
         for _, item in self.block:
             self.add_run(*item)
-        code, text = self.main(run_one=lambda *a: self.fail("nothing should run"))
+        code, text = self.main(run_one=lambda *a: self.fail("nothing should run"),
+                               run_guard=lambda *a: self.fail("no warm-up without runs"))
         self.assertEqual(code, 0)
         self.assertIn("nothing to run", text)
+
+    def test_guard_runs_once_before_the_block(self):
+        order = []
+
+        def run_guard(output, check):
+            self.assertEqual(output, self.base)
+            order.append("guard")
+            return {"guard_id": "g"}, 0
+
+        def run_one(name, rep, mode, phases, batch, timeout_ms=None, guard=None):
+            order.append("run")
+            return {"validity": {"status": "valid", "reasons": []}}
+
+        code, _ = self.main(run_one=run_one, run_guard=run_guard)
+        self.assertEqual(code, 0)
+        self.assertEqual(order, ["guard"] + ["run"] * len(self.block))
+
+    def test_guard_refusal_stops_the_block_with_its_exit_code(self):
+        code, _ = self.main(run_one=lambda *a, **k: self.fail("the block must not run"),
+                            run_guard=lambda output, check: (None, o.GUARD_REFUSED_EXIT))
+        self.assertEqual(code, o.GUARD_REFUSED_EXIT)
+        self.assertNotEqual(code, 0)
+
+    def test_guard_of_official_mode_uses_the_full_precheck(self):
+        checks = []
+
+        def run_guard(output, check):
+            checks.append(check)
+            return None, 2
+
+        self.main(run_one=lambda *a, **k: self.fail("the block must not run"), run_guard=run_guard)
+        with mock.patch.object(o, "precheck", return_value={"dirty": False}) as precheck:
+            checks[0]()
+        precheck.assert_called_once_with("official")
 
 
 V1_OFFICIAL = Path(r"C:\tcc-data\official")
@@ -542,7 +585,8 @@ class OutputDirTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             o.check_official_items([("cpu92", 6)])
         out = io.StringIO()
-        with mock.patch.object(o, "lookup_timeout_ms", lambda: TIMEOUT_MS), contextlib.redirect_stdout(out):
+        with mock.patch.object(o, "lookup_timeout_ms", lambda: TIMEOUT_MS), contextlib.redirect_stdout(out), \
+                mock.patch.object(o, "pinned_images", lambda: PINNED):
             code = o.main(["run", "--mode", "validation", "--condition", "net_slow", "--repetition", "1", "--dry-run"])
         self.assertEqual(code, 0)
         text = out.getvalue()
@@ -550,6 +594,379 @@ class OutputDirTest(unittest.TestCase):
         start = o.start_offset("net_slow", 1)["start_offset_s"]
         self.assertIn(f"apply=t0+{start}s remove=t0+{start + 120}s", text)
         self.assertIn("latency 76 jitter 11 ms", text)
+        self.assertIn("calibration guard before the block", text)
+
+
+def compose_runner(images):
+    config = {"services": {service: ({"image": image} if image else {}) for service, image in images.items()}}
+    return lambda args: SimpleNamespace(stdout=json.dumps(config))
+
+
+class ImagesTest(unittest.TestCase):
+    def test_pinned_images_from_compose_config(self):
+        runner = compose_runner({"stresser-app": f"stresser-observability@{GO_DIGEST}",
+                                 "application-api": f"application-api@{API_DIGEST}"})
+        self.assertEqual(o.pinned_images(runner), PINNED)
+
+    def test_image_without_digest_is_refused(self):
+        for image in ("stresser-observability:1.0.0", "stresser-observability@sha256:abc", ""):
+            runner = compose_runner({"stresser-app": image, "application-api": f"application-api@{API_DIGEST}"})
+            with self.assertRaises(o.PrecheckError):
+                o.pinned_images(runner)
+
+    def test_running_images_come_from_the_containers(self):
+        def runner(args):
+            if args[:3] == ["docker", "compose", "ps"]:
+                return SimpleNamespace(stdout=f"id-{args[-1]}\n")
+            self.assertEqual(args[:3], ["docker", "inspect", "--format"])
+            return SimpleNamespace(stdout={"id-stresser-app": GO_DIGEST, "id-application-api": API_DIGEST}[args[-1]] + "\n")
+
+        self.assertEqual(o.running_images(runner), PINNED)
+
+    def test_service_without_container_is_refused(self):
+        with self.assertRaises(o.PrecheckError):
+            o.service_container("stresser-app", lambda args: SimpleNamespace(stdout="\n"))
+
+    def test_different_digest_is_refused(self):
+        o.check_images(PINNED, dict(PINNED))
+        other = "sha256:" + "c" * 64
+        with self.assertRaises(o.PrecheckError) as caught:
+            o.check_images(PINNED, {**PINNED, "stresser-app": other})
+        self.assertIn(f"stresser-app: running {other}, pinned {GO_DIGEST}", str(caught.exception))
+        with self.assertRaises(o.PrecheckError):
+            o.check_images(PINNED, {"stresser-app": GO_DIGEST})
+
+    def test_recreation_never_builds_or_pulls(self):
+        calls = []
+
+        def sh(args, **kwargs):
+            calls.append(args)
+            return SimpleNamespace(stdout="7\n")
+
+        with mock.patch.object(o, "sh", sh), mock.patch.object(o, "compose_services",
+                                                               lambda: {"application-api": {"Health": "healthy"}}):
+            o.recreate_api(7)
+        up = next(c for c in calls if "up" in c)
+        self.assertIn("--no-build", up)
+        self.assertEqual(up[up.index("--pull") + 1], "never")
+        self.assertNotIn("--build", up)
+
+
+T0_NS = 1_800_000_000 * exporter.NS
+READ_NS = T0_NS + 15 * exporter.NS
+
+
+def lookup_rows(count, seconds, first_ns=READ_NS):
+    """One FastAPI line and one Go line per lookup, evenly spread over the window."""
+    rows = []
+    for index in range(count):
+        t = first_ns + index * seconds * exporter.NS // count
+        for line in ({"service": "stresser-app", "event": "state_queried", "request_id": f"r{index}"},
+                     {"service": "application-api", "event": "products_completed", "status_code": 200,
+                      "latency_ms": 10.0, "request_id": f"r{index}"}):
+            rows.append((t, json.dumps(line), line))
+    return rows
+
+
+def readings(cpu_seconds, seconds=100):
+    return [{"utc_ns": READ_NS, "usage_usec": 5_000_000},
+            {"utc_ns": READ_NS + seconds * exporter.NS, "usage_usec": 5_000_000 + round(cpu_seconds * 1e6)}]
+
+
+class GoCpuTest(unittest.TestCase):
+    def test_reference_constants_of_b13(self):
+        self.assertEqual((o.GO_CPU_MS_PER_LOOKUP, o.GO_CPU_MS_TOLERANCE, o.GO_CPU_PERCENT_RANGE,
+                          o.GUARD_MAX_TIMEOUT_RATE, o.GUARD_SECONDS), (62.1, 5.0, (45.0, 55.0), 0.01, 120))
+
+    def test_cpu_stat_reading(self):
+        stat = "usage_usec 1234\nuser_usec 1000\nsystem_usec 234\nnr_periods 5\n"
+        with mock.patch.object(o, "sh", lambda args, timeout: SimpleNamespace(stdout=stat)):
+            self.assertEqual(o.read_go_cpu("c")["usage_usec"], 1234)
+
+    def test_window_counts_every_go_record_of_a_lookup_inside_it(self):
+        first, last = readings(49.68)
+        rows = lookup_rows(800, 100)
+        for t, event in ((READ_NS - 1, "state_queried"), (last["utc_ns"], "state_queried")):  # outside
+            rows.append((t, "", {"service": "stresser-app", "event": event, "request_id": "x"}))
+        rows.append((READ_NS, "", {"service": "stresser-app", "event": "state_request_canceled", "request_id": "c"}))
+        rows.append((READ_NS, "", {"service": "stresser-app", "event": "state_request_deadline_exceeded", "request_id": "d"}))
+        rows.append((READ_NS, "", {"service": "stresser-app", "event": "service_started"}))
+        cpu = o.go_cpu_window(first, last, rows)
+        self.assertEqual(cpu["go_lookups"], 802)
+        self.assertEqual(cpu["go_cpu_ms_per_lookup"], 61.945)
+        self.assertEqual((cpu["go_cpu_percent"], cpu["seconds"]), (49.68, 100.0))
+
+    def test_window_without_lookups(self):
+        cpu = o.go_cpu_window(*readings(1), [])
+        self.assertIsNone(cpu["go_cpu_ms_per_lookup"])
+        self.assertEqual(o.cpu_per_lookup_reasons(cpu, "x"), ["x: no Go lookup in the CPU window"])
+
+    def test_timeouts_count_each_lookup_once(self):
+        rows = [(1, "", {"service": "application-api", "event": "stresser_lookup_failed", "error_type": "ReadTimeout",
+                         "request_id": "a"}),
+                (2, "", {"service": "stresser-app", "event": "state_request_deadline_exceeded", "request_id": "a"}),
+                (3, "", {"service": "stresser-app", "event": "state_request_deadline_exceeded", "request_id": "b"}),
+                (4, "", {"service": "application-api", "event": "stresser_lookup_failed", "error_type": "ConnectError",
+                         "request_id": "c"}),
+                (5, "", {"service": "stresser-app", "event": "state_request_canceled", "request_id": "d"})]
+        self.assertEqual(o.lookup_timeouts(rows), 2)
+
+
+class GuardEvaluationTest(unittest.TestCase):
+    @staticmethod
+    def cpu(per_lookup=62.1, percent=49.8):
+        return {"go_cpu_ms_per_lookup": per_lookup, "go_cpu_percent": percent}
+
+    def test_approves_the_calibrated_values(self):
+        self.assertEqual(o.guard_reasons(self.cpu(), 800, 0), [])
+        self.assertEqual(o.guard_reasons(self.cpu(), 800, 1), [], "0.1% of timeouts is expected, never a refusal")
+
+    def test_limits_are_inclusive(self):
+        for per_lookup in (57.1, 67.1):
+            self.assertEqual(o.guard_reasons(self.cpu(per_lookup=per_lookup), 800, 0), [])
+        for percent in (45.0, 55.0):
+            self.assertEqual(o.guard_reasons(self.cpu(percent=percent), 800, 0), [])
+        self.assertEqual(o.guard_reasons(self.cpu(), 800, 8), [], "exactly 1%")
+
+    def test_refuses_cpu_per_lookup_out_of_range(self):
+        for per_lookup in (57.09, 67.11, 81.3):
+            reasons = o.guard_reasons(self.cpu(per_lookup=per_lookup), 800, 0)
+            self.assertEqual(reasons, [f"guard: Go CPU {per_lookup} ms per lookup outside 57.1-67.1 ms"])
+
+    def test_refuses_use_out_of_range(self):
+        for percent in (44.99, 55.01, 65.2):
+            self.assertEqual(o.guard_reasons(self.cpu(percent=percent), 800, 0),
+                             [f"guard: Go CPU use {percent}% outside 45-55%"])
+
+    def test_refuses_timeouts_above_one_percent(self):
+        self.assertEqual(o.guard_reasons(self.cpu(), 800, 9), ["guard: 9 timeouts in 800 lookups above 1%"])
+
+    def test_reports_every_reason(self):
+        self.assertEqual(len(o.guard_reasons(self.cpu(81.3, 65.2), 800, 20)), 3)
+
+
+class FakeK6:
+    def __init__(self, run_id, scenario, duration, seed, exit_code=0, requests=800):
+        self.args = (run_id, scenario, duration, seed)
+        self.duration, self.exit_code, self.requests = duration, exit_code, requests
+
+    def start(self):
+        pass
+
+    def running(self):
+        return False
+
+    def wait(self, timeout):
+        return self.exit_code
+
+    def summary(self):
+        return {"http_reqs": self.requests, "dropped_iterations": 0, "duration": self.duration}
+
+
+class GuardFlowTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.output = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def guard(self, cpu_seconds=49.68, rows=None, k6=FakeK6, check=lambda: None):
+        recreated = []
+        rows = lookup_rows(800, 100) if rows is None else rows
+        with mock.patch.object(o, "lookup_timeout_ms", lambda: TIMEOUT_MS), \
+                mock.patch.object(o, "verified_images", lambda: {"pinned": PINNED, "running": PINNED}), \
+                mock.patch.object(o, "recreate_api", lambda seed, lookup_timeout: recreated.append((seed, lookup_timeout))), \
+                mock.patch.object(o, "service_container", lambda service: "go"), \
+                mock.patch.object(o, "K6Process", k6), mock.patch.object(o, "sleep_until", lambda t: None), \
+                mock.patch.object(o, "read_go_cpu", side_effect=readings(cpu_seconds)), \
+                mock.patch.object(o.time, "sleep"), mock.patch.object(o, "log"), \
+                mock.patch.object(o.exporter, "collect", lambda *a, **k: (rows, {})):
+            try:
+                return o.calibration_guard(self.output, check)
+            finally:
+                self.recreated = recreated
+
+    def written(self):
+        [path] = (self.output / "control").glob("guard-*.json")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_approval_is_recorded(self):
+        result = self.guard()
+        self.assertEqual(self.written(), result)
+        self.assertTrue(result["approved"])
+        self.assertEqual(result["go_cpu"]["go_cpu_ms_per_lookup"], 62.1)
+        self.assertEqual((result["lookup_requests"], result["lookup_timeouts"], result["timeout_rate"]), (800, 0, 0.0))
+        self.assertEqual(result["images"]["running"], PINNED)
+        self.assertEqual(self.recreated, [(result["seed"], TIMEOUT_MS)])
+        manifest = (self.output / "control" / "manifest.sha256").read_text(encoding="utf-8")
+        self.assertIn(f"control/guard-{result['guard_id']}.json", manifest)
+
+    def test_warm_up_is_a_baseline_of_two_minutes_with_fixed_seeds(self):
+        seen = []
+
+        class K6(FakeK6):
+            def __init__(self, *args):
+                super().__init__(*args)
+                seen.append(self.args)
+
+        first = self.guard(k6=K6)
+        self.guard(k6=K6)
+        self.assertEqual([args[1:3] for args in seen], [("baseline", "120s")] * 2)
+        self.assertEqual(seen[0][3], seen[1][3])
+        self.assertNotEqual(seen[0][0], seen[1][0])
+        self.assertEqual(first["k6_seed"], seen[0][3])
+
+    def test_refusal_is_recorded_and_raises(self):
+        with self.assertRaises(o.CalibrationGuardError) as caught:
+            self.guard(cpu_seconds=65.0)
+        self.assertIn("Go CPU 81.25 ms per lookup", str(caught.exception))
+        written = self.written()
+        self.assertFalse(written["approved"])
+        self.assertEqual(len(written["reasons"]), 2)
+
+    def test_refuses_when_nothing_could_be_measured(self):
+        with self.assertRaises(o.CalibrationGuardError) as caught:
+            self.guard(rows=[])
+        self.assertIn("no Go lookup", str(caught.exception))
+
+    def test_refuses_k6_failure(self):
+        with self.assertRaises(o.CalibrationGuardError) as caught:
+            self.guard(k6=lambda *args: FakeK6(*args, exit_code=99))
+        self.assertIn("k6 exit code 99", str(caught.exception))
+
+    def test_failed_check_starts_nothing(self):
+        def check():
+            raise o.PrecheckError("official mode requires a clean Git tree")
+
+        with self.assertRaises(o.PrecheckError):
+            self.guard(k6=lambda *a: self.fail("no load after a failed check"), check=check)
+        self.assertEqual(self.recreated, [])
+        self.assertFalse((self.output / "control").exists())
+
+    def test_exit_codes(self):
+        for error, code in ((o.CalibrationGuardError("x"), o.GUARD_REFUSED_EXIT), (o.PrecheckError("x"), 2),
+                            (o.InfraError("x"), 1), (KeyboardInterrupt(), 130)):
+            with mock.patch.object(o, "calibration_guard", side_effect=error), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(o.run_guard(self.output), (None, code))
+        with mock.patch.object(o, "calibration_guard", return_value={"approved": True}):
+            self.assertEqual(o.run_guard(self.output), ({"approved": True}, 0))
+
+    def test_guard_refuses_protected_output(self):
+        with mock.patch.object(o, "calibration_guard", side_effect=AssertionError("must not run")), \
+                self.assertRaises(o.OutputGuardError):
+            o.run_guard(V1_OFFICIAL)
+
+    def test_guard_command_needs_no_git(self):
+        with mock.patch.object(o, "calibration_guard", return_value={}) as guard, \
+                mock.patch.object(o, "git_state", side_effect=AssertionError("no Git here")):
+            self.assertEqual(o.main(["guard", "--output", str(self.output)]), 0)
+        self.assertEqual(guard.call_args.args, (self.output, o.check_stack))
+
+    def test_test_mode_has_no_guard(self):
+        def run_one(name, rep, mode, phases, batch, timeout_ms=None, guard=None):
+            self.assertIsNone(guard)
+            return {"validity": {"status": "valid", "reasons": []}}
+
+        out = io.StringIO()
+        with mock.patch.object(o, "lookup_timeout_ms", lambda: TIMEOUT_MS), contextlib.redirect_stdout(out), \
+                mock.patch.object(o, "pinned_images", lambda: PINNED), mock.patch.object(o, "run_one", run_one), \
+                mock.patch.object(o, "run_guard", side_effect=AssertionError("no guard in test mode")):
+            self.assertEqual(o.main(["run", "--mode", "test", "--condition", "baseline", "--repetition", "1"]), 0)
+        self.assertIn("calibration guard: not run in test mode", out.getvalue())
+
+    def test_unpinned_compose_aborts_the_plan(self):
+        err = io.StringIO()
+        with mock.patch.object(o, "lookup_timeout_ms", lambda: TIMEOUT_MS), contextlib.redirect_stderr(err), \
+                mock.patch.object(o, "pinned_images", side_effect=o.PrecheckError("must fix the image by digest")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = o.main(["run", "--mode", "official", "--condition", "baseline", "--repetition", "1", "--dry-run"])
+        self.assertEqual(code, 2)
+        self.assertIn("must fix the image by digest", err.getvalue())
+
+
+class RunMetadataTest(unittest.TestCase):
+    """run_one end to end with the stack replaced: image check, metadata and the pre-injection invalidation."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.base = self.root / o.MODE_DIRS["official"]
+        self.order = []
+
+    def run_item(self, mode="official", phases=None, cpu_seconds=49.68, images=None, k6=None, requests=800, window=100):
+        rows = lookup_rows(requests, window)
+        values = readings(cpu_seconds)
+
+        def read(container):
+            self.order.append(("read", container))
+            return values.pop(0)
+
+        def apply(condition, timeout_ms):
+            self.order.append(("apply",))
+            return []
+
+        verified = images or (lambda: {"pinned": PINNED, "running": PINNED})
+        with mock.patch.object(o, "precheck", lambda mode: {"commit": "c" * 40, "dirty": False, "porcelain": []}), \
+                mock.patch.object(o, "recreate_api", lambda seed, lookup_timeout: None), \
+                mock.patch.object(o, "verified_images", verified), \
+                mock.patch.object(o, "stack_state", lambda: ({"stress_level": 0, "cpu_workers": 0}, [])), \
+                mock.patch.object(o, "service_container", lambda service: "go"), \
+                mock.patch.object(o, "K6Process", k6 or (lambda *a: FakeK6(*a, requests=requests))), \
+                mock.patch.object(o, "sleep_until", lambda t: None), mock.patch.object(o, "read_go_cpu", read), \
+                mock.patch.object(o, "apply_intervention", apply), mock.patch.object(o, "remove_intervention", lambda c: []), \
+                mock.patch.object(o, "cleanup", lambda: {"confirmed": True}), mock.patch.object(o, "log"), \
+                mock.patch.object(o.time, "sleep"), mock.patch.object(o, "k6_status_counts", lambda *a: ({}, 0)), \
+                mock.patch.object(o.exporter, "collect", lambda *a, **k: (rows, {})):
+            return o.run_one("baseline", 1, mode, phases, data_root=self.root, timeout_ms=TIMEOUT_MS,
+                             guard={"guard_id": "g"})
+
+    def test_digest_mismatch_refuses_before_the_load(self):
+        def differs():
+            raise o.PrecheckError("running image differs from docker-compose.yml")
+
+        with self.assertRaises(o.PrecheckError):
+            self.run_item(images=differs, k6=lambda *a: self.fail("no load with another image"))
+        self.assertFalse(self.base.exists())
+
+    def test_metadata_records_images_guard_and_pre_injection_cpu(self):
+        record = self.run_item()
+        self.assertEqual(record["validity"], {"status": "valid", "reasons": []})
+        path = self.base / "control" / f"{record['experiment_run_id']}-phases.json"
+        written = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(written["images"], {"pinned": PINNED, "running": PINNED})
+        self.assertEqual(written["calibration_guard"], {"guard_id": "g"})
+        cpu = written["pre_injection_cpu"]
+        self.assertEqual((cpu["go_cpu_ms_per_lookup"], cpu["go_cpu_percent"], cpu["go_lookups"]), (62.1, 49.68, 800))
+
+    def test_readings_come_before_the_injection(self):
+        self.run_item()
+        self.assertEqual(self.order, [("read", "go"), ("read", "go"), ("apply",)])
+
+    def test_cpu_out_of_range_invalidates_and_the_resume_repeats_it(self):
+        valid = self.run_item()
+        self.assertEqual(o.completed_items(self.base, "official", TIMEOUT_MS),
+                         {("baseline", 1): valid["experiment_run_id"]})
+        (self.base / "control" / "runs.csv").unlink()
+        for cpu_seconds, shown in ((65.0, 81.25), (40.0, 50.0)):
+            record = self.run_item(cpu_seconds=cpu_seconds)
+            self.assertEqual(record["validity"], {"status": "invalid", "reasons": [
+                f"pre-injection: Go CPU {shown} ms per lookup outside 57.1-67.1 ms"]})
+        self.assertEqual(o.completed_items(self.base, "official", TIMEOUT_MS), {})
+
+    def test_pre_injection_criterion_is_only_cpu_per_lookup(self):
+        k6 = {"exit_code": 0, "status0": 0, "summary": {"duration": "90s", "dropped_iterations": 0, "http_reqs": 10}}
+        corr = {"fastapi_final_events": 10, "one_to_one": True}
+        ok = {"go_cpu_ms_per_lookup": 62.1, "go_cpu_percent": 70.0}
+        self.assertEqual(o.evaluate_validity(k6, {"confirmed": True}, corr, "90s", ok)["status"], "valid")
+        self.assertEqual(o.evaluate_validity(k6, {"confirmed": True}, corr, "90s",
+                                             {**ok, "go_cpu_ms_per_lookup": None})["status"], "invalid")
+
+    def test_short_normal_phase_has_no_window(self):
+        record = self.run_item(mode="test", phases=[10, 10, 10], requests=10, window=10)
+        self.assertEqual(self.order, [("apply",)])
+        self.assertIsNone(record["pre_injection_cpu"])
+        self.assertEqual(record["validity"]["status"], "valid")
 
 
 if __name__ == "__main__":

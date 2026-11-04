@@ -51,18 +51,22 @@ CPU_LEVELS = tuple(c.stress_level for n, c in o.CONDITIONS.items()
 
 def run(conditions, mode=MODE):
     output = o.DATA_ROOT / o.MODE_DIRS[mode]
-    if output.exists():
+    # runs.csv, not the directory: a refused calibration guard only leaves its record and can be repeated.
+    if (output / "control" / "runs.csv").exists():
         print(f"ERROR: refusing to overwrite existing output: {output}", file=sys.stderr)
         return 1
     expected = pilot.expected_config()
     pilot.check_config(pilot.container_ids(), expected)
     timeout_ms = o.lookup_timeout_ms()
     state = {"expected": expected, "expected_gomaxprocs": pilot.expected_gomaxprocs(expected)}
-    pilot.instrument(state)
     print(o.describe_plan([(c, 1) for c in conditions], mode, None, None, timeout_ms), flush=True)
+    guard, code = o.run_guard(output, lambda: o.precheck(mode))
+    if code:
+        return code
+    pilot.instrument(state)  # after the guard: its readings belong to the runs
     for condition in conditions:
         try:
-            record = o.run_one(condition, 1, mode, None, None, timeout_ms=timeout_ms)
+            record = o.run_one(condition, 1, mode, None, None, timeout_ms=timeout_ms, guard=guard)
         except (o.PrecheckError, o.InfraError) as error:
             print(f"STOP at {condition}: {error}", file=sys.stderr)
             return 1
