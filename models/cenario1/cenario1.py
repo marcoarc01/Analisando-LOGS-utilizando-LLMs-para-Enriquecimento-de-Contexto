@@ -110,11 +110,11 @@ def prediction_rows(windows, scores, preds):
             for w, s, p in zip(windows, scores, preds)]
 
 
-def top_features(vectorizer, importances, templates):
+def top_features(vectorizer, importances, templates, count=TOP_FEATURES):
     names = vectorizer.get_feature_names_out()
     mean = np.mean(importances, axis=0)
     out = []
-    for i in np.argsort(-mean, kind="stable")[:TOP_FEATURES]:
+    for i in np.argsort(-mean, kind="stable")[:count]:
         template_id = int(str(names[i])[1:])
         spread = metrics.mean_std([float(imp[i]) for imp in importances])
         out.append({"feature": str(names[i]), "template_id": template_id, "template": templates[template_id],
