@@ -12,7 +12,7 @@ from pathlib import Path
 import build_windows as v1
 import drain_templates_v2 as d
 import sanitize
-from common import DERIVED_V2_DIR, OFFICIAL_V2_DIR, PipelineError, csv_bytes, sha256_bytes, write_new
+from common import DERIVED_V2_DIR, OFFICIAL_V2_DIR, PipelineError, csv_bytes, request_arrivals as arrivals, sha256_bytes, write_new
 
 VIEWS = d.VIEWS
 SPLITS = d.SPLITS
@@ -29,17 +29,6 @@ def read_t0(official_dir, run_id):
     if record["experiment_run_id"] != run_id:
         raise PipelineError(f"{run_id}: phases.json is of another run")
     return sanitize.ts_ns(record["schedule"]["t0_utc"])
-
-
-def arrivals(rows):
-    """req -> time of its first FastAPI line in canonical order."""
-    first = {}
-    for row in rows:
-        if row["service"] == FASTAPI:
-            current = first.get(row["req"])
-            if current is None or row["event_order"] < current[0]:
-                first[row["req"]] = (row["event_order"], row["ts"])
-    return {req: ts for req, (_, ts) in first.items()}
 
 
 def assign_windows(rows, t0):

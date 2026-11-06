@@ -45,6 +45,17 @@ def valid_runs(official_dir, commit=SOURCE_COMMIT):
     return runs
 
 
+def request_arrivals(rows, service="application-api"):
+    """req -> time of its first FastAPI line in canonical order. rows: dicts with service, req, event_order and ts."""
+    first = {}
+    for row in rows:
+        if row["service"] == service:
+            current = first.get(row["req"])
+            if current is None or row["event_order"] < current[0]:
+                first[row["req"]] = (row["event_order"], row["ts"])
+    return {req: ts for req, (_, ts) in first.items()}
+
+
 def sha256_bytes(content):
     return hashlib.sha256(content).hexdigest()
 

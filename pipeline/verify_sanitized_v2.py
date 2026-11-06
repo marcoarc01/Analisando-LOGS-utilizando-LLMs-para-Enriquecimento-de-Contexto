@@ -50,7 +50,7 @@ LOOKUP_EVENT = "dependency_request_sent"
 CHECKS = ("splits", "names", "fields", "terms", "digits", "ids", "encoding", "lines", "order", "correlation", "alignment",
           "texts", "manifest")
 MAX_DETAILS = 10
-LATER_STAGES = ("drain", "windows", "c2c")  # each has its own manifest
+LATER_STAGES = ("drain", "windows", "c2c", "labels")  # each has its own manifest
 
 
 def text_problems(text):
