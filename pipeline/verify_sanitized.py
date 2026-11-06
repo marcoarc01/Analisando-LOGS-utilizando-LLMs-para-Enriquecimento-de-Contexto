@@ -112,7 +112,7 @@ def read_csv(path):
         return reader.fieldnames, list(reader)
 
 
-def check_splits(derived_dir, runs):
+def check_splits(derived_dir, runs, assign=split_runs.assign_splits, split_sizes=split_runs.SPLIT_SIZES):
     problems = []
     gold_path, public_path = split_runs.split_paths(derived_dir)
     gold_columns, gold_rows = read_csv(gold_path)
@@ -129,15 +129,15 @@ def check_splits(derived_dir, runs):
         problems.append(("splits", "split files do not cover exactly the valid runs"))
     if any(public.get(i) != r["split"] or conditions.get(i) != r["condition"] for i, r in gold.items()):
         problems.append(("splits", "gold and public splits disagree, or condition differs from runs.csv"))
-    expected = {a["experiment_run_id"]: a["split"] for a in split_runs.assign_splits(runs)}
+    expected = {a["experiment_run_id"]: a["split"] for a in assign(runs)}
     if {i: r["split"] for i, r in gold.items()} != expected:
         problems.append(("splits", "assignment differs from the deterministic split"))
     counts = collections.Counter((r["condition"], r["split"]) for r in gold_rows)
-    for condition, sizes in split_runs.SPLIT_SIZES.items():
+    for condition, sizes in split_sizes.items():
         if [counts[(condition, split)] for split in split_runs.SPLITS] != list(sizes):
             problems.append(("splits", f"{condition}: counts differ from {sizes}"))
     totals = collections.Counter(r["split"] for r in gold_rows)
-    expected_totals = [sum(sizes[i] for sizes in split_runs.SPLIT_SIZES.values()) for i in range(len(split_runs.SPLITS))]
+    expected_totals = [sum(sizes[i] for sizes in split_sizes.values()) for i in range(len(split_runs.SPLITS))]
     if [totals[split] for split in split_runs.SPLITS] != expected_totals:
         problems.append(("splits", f"totals {dict(totals)} differ from {expected_totals}"))
     return problems, {"totals": totals, "counts": counts}
@@ -157,13 +157,15 @@ def check_names(derived_dir, run_ids):
     return problems
 
 
-def check_manifest(derived_dir):
+def check_manifest(derived_dir, exclude=()):
+    """exclude: top folders written by later stages, which have their own manifests."""
     manifest = derived_dir / "control" / "manifest.sha256"
     listed = {}
     for line in manifest.read_text(encoding="utf-8").splitlines():
         digest, _, name = line.partition("  ")
         listed[name] = digest
-    present = {p.relative_to(derived_dir).as_posix() for p in derived_dir.rglob("*") if p.is_file() and p != manifest}
+    present = {p.relative_to(derived_dir).as_posix() for p in derived_dir.rglob("*") if p.is_file() and p != manifest
+               and p.relative_to(derived_dir).parts[0] not in exclude}
     problems = [("manifest", f"files not in manifest: {sorted(present - set(listed))[:5]}")] if present - set(listed) else []
     if set(listed) - present:
         problems.append(("manifest", f"listed files missing: {sorted(set(listed) - present)[:5]}"))

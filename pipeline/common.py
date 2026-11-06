@@ -6,6 +6,9 @@ from pathlib import Path
 OFFICIAL_DIR = Path(r"C:\tcc-data\official")
 DERIVED_DIR = Path(r"C:\tcc-data\derived\v1")
 SOURCE_COMMIT = "4b45cde23610cefebb6167e90454153a56077644"
+OFFICIAL_V2_DIR = Path(r"C:\tcc-data\official-v2")
+DERIVED_V2_DIR = Path(r"C:\tcc-data\derived\v2")
+SOURCE_COMMIT_V2 = "528d33fc60556993ea553225e46ece72c3134f6a"
 # Dataset v1 (official collection at SOURCE_COMMIT): the v1 split, sanitize and windows steps read these names.
 CONDITIONS_V1 = (
     "baseline", "cpu75", "cpu80", "cpu92", "net_latency500", "net_timeout2500",
@@ -27,15 +30,15 @@ class PipelineError(Exception):
     pass
 
 
-def valid_runs(official_dir):
+def valid_runs(official_dir, commit=SOURCE_COMMIT):
     with open(official_dir / "control" / "runs.csv", encoding="utf-8", newline="") as f:
         runs = [row for row in csv.DictReader(f) if row["status"] == "valid"]
     if not runs:
         raise PipelineError("runs.csv has no valid runs")
     divergent = [r["experiment_run_id"] for r in runs
-                 if r["commit"] != SOURCE_COMMIT or r["dirty"] != "False" or r["mode"] != "official"]
+                 if r["commit"] != commit or r["dirty"] != "False" or r["mode"] != "official"]
     if divergent:
-        raise PipelineError(f"valid runs not from clean commit {SOURCE_COMMIT} in official mode: {divergent}")
+        raise PipelineError(f"valid runs not from clean commit {commit} in official mode: {divergent}")
     ids = [r["experiment_run_id"] for r in runs]
     if len(set(ids)) != len(ids):
         raise PipelineError("runs.csv repeats an experiment_run_id")

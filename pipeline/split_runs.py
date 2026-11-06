@@ -22,16 +22,16 @@ def condition_seed(condition, seed=SPLIT_SEED):
     return int.from_bytes(hashlib.sha256(f"{seed}:{condition}".encode()).digest()[:8], "big")
 
 
-def assign_splits(runs, seed=SPLIT_SEED):
+def assign_splits(runs, seed=SPLIT_SEED, conditions=CONDITIONS, split_sizes=SPLIT_SIZES):
     groups = collections.defaultdict(list)
     for run in runs:
         groups[run["condition"]].append(run)
-    if set(groups) != set(CONDITIONS):
+    if set(groups) != set(conditions):
         raise PipelineError(f"conditions differ from the catalog: {sorted(groups)}")
     assigned = []
-    for condition in CONDITIONS:
+    for condition in conditions:
         group = sorted(groups[condition], key=lambda r: int(r["repetition"]))
-        sizes = SPLIT_SIZES[condition]
+        sizes = split_sizes[condition]
         if [int(r["repetition"]) for r in group] != list(range(1, sum(sizes) + 1)):
             raise PipelineError(f"{condition}: expected repetitions 1..{sum(sizes)}, got "
                                 f"{[int(r['repetition']) for r in group]}")
@@ -39,7 +39,7 @@ def assign_splits(runs, seed=SPLIT_SEED):
         labels = [split for split, n in zip(SPLITS, sizes) for _ in range(n)]
         assigned += [{"experiment_run_id": r["experiment_run_id"], "condition": condition,
                       "repetition": int(r["repetition"]), "split": label} for r, label in zip(group, labels)]
-    return sorted(assigned, key=lambda a: (CONDITIONS.index(a["condition"]), a["repetition"]))
+    return sorted(assigned, key=lambda a: (conditions.index(a["condition"]), a["repetition"]))
 
 
 def main(argv=None):
