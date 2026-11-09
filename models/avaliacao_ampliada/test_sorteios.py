@@ -1,7 +1,7 @@
 import unittest
 
 from models.common import data
-from models.e0 import sorteios as s
+from models.avaliacao_ampliada import sorteios as s
 
 COUNTS = {"Normal": 225, "CPU": 18, "Rede": 19, "Combinado": 45}
 

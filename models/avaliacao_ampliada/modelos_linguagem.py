@@ -3,9 +3,9 @@ with full data, detection with full data and the 15 low-resource draws of both t
 the E2, the checkpoints of the 2b and of the LUK in the D5 (--model bert_mlm_2b|bert_luk --encoder <path> --output ... --checkpoints ...).
 
 Stages, each a separate process, run from the repository root with C:\\tcc-venv\\bert:
-  python -m models.e2.e2 select    GPU free, hashes; full-data runs (seeds 42-46, best epoch on validation, checkpoints written) and the
+  python -m models.avaliacao_ampliada.modelos_linguagem select    GPU free, hashes; full-data runs (seeds 42-46, best epoch on validation, checkpoints written) and the
                                    shuffled-labels control; validation results and analysis; writes selection.json. The test is not opened.
-  python -m models.e2.e2 evaluate  validation of the saved checkpoints recomputed and compared with select (before the test); writes
+  python -m models.avaliacao_ampliada.modelos_linguagem evaluate  validation of the saved checkpoints recomputed and compared with select (before the test); writes
                                    test_access.json and refuses a second evaluation; reads the test once; full-data runs on the two tests;
                                    latency; full-data detection copied from the D1 (BERT-base); low-resource runs, each trained with its
                                    best point chosen on validation and only then evaluated on the tests (their weights are never written).
@@ -31,11 +31,11 @@ from transformers import AutoModel, get_linear_schedule_with_warmup  # noqa: E40
 from models.cenario1 import cenario1 as c1  # noqa: E402
 from models.cenario1 import cenario1_v2 as c1v2  # noqa: E402
 from models.common import data, data_v2, metrics, window_text as wt  # noqa: E402
-from models.e1 import e1  # noqa: E402
+from models.avaliacao_ampliada import classicos  # noqa: E402
 
-VIEW = e1.VIEW
-CLASSES = e1.CLASSES
-DETECTION, DIAGNOSIS, FULL = e1.DETECTION, e1.DIAGNOSIS, e1.FULL
+VIEW = classicos.VIEW
+CLASSES = classicos.CLASSES
+DETECTION, DIAGNOSIS, FULL = classicos.DETECTION, classicos.DIAGNOSIS, classicos.FULL
 TASKS = (DETECTION, DIAGNOSIS)
 N_LABELS = {DETECTION: 2, DIAGNOSIS: len(CLASSES)}
 LEARNING_RATE = 5e-5
@@ -89,7 +89,7 @@ def check_checkpoint_manifest(path, manifest):
         if not line.strip() or line.startswith("#"):
             continue
         digest, name = line.split(maxsplit=1)
-        if e1.sha(base / name.lstrip("*")) != digest:
+        if classicos.sha(base / name.lstrip("*")) != digest:
             raise data.ModelError(f"{name}: differs from {manifest}")
         checked += 1
     return checked
@@ -144,7 +144,7 @@ def check_fine_tuning(pre, model_name, encoder):
 
 
 def verify(model_name, encoder):
-    pre, verification = e1.verify_preregistration()
+    pre, verification = classicos.verify_preregistration()
     verification["files"]["results/cenario2 (manifest)"] = data.verify_manifest(D1_DIR)
     verification["files"]["results/e1 (manifest)"] = data.verify_manifest(E1_DIR)
     if model_name != BERT:
@@ -164,15 +164,15 @@ def tokenize(loaded, templates, tokenizer):
 
 
 def load_train_validation(tokenizer):
-    causes = e1.cause_rows()
-    templates, sets = e1.load_train_validation(causes)
+    causes = classicos.cause_rows()
+    templates, sets = classicos.load_train_validation(causes)
     for s in sets.values():
         tokenize(s, templates, tokenizer)
     return causes, templates, sets
 
 
 def evaluated_sets(sets, include_test):
-    out = e1.evaluated_sets(sets, include_test)
+    out = classicos.evaluated_sets(sets, include_test)
     if include_test:
         principal = [i for i, p in enumerate(sets["test"]["principal"]) if p]
         out["test_principal"]["input_ids"] = [sets["test"]["input_ids"][i] for i in principal]
@@ -181,7 +181,7 @@ def evaluated_sets(sets, include_test):
 
 
 def subset(loaded, indexes):
-    out = e1.subset(loaded, indexes)
+    out = classicos.subset(loaded, indexes)
     out["input_ids"] = [loaded["input_ids"][i] for i in indexes]
     return out
 
@@ -290,7 +290,7 @@ def train_run(task, train, validation, seed, build, pad_id, device, steps=STEPS,
             probabilities, validation_loss = predict(model, validation["input_ids"], pad_id, device, y_val)
             eval_seconds += time.perf_counter() - started
             row = {"point": step // every, "step": step, "train_loss": total / seen, "validation_loss": validation_loss,
-                   "validation_metric": main_metric(task, y_val, e1.decide(probabilities, task))}
+                   "validation_metric": main_metric(task, y_val, classicos.decide(probabilities, task))}
             history.append(row)
             if better(row, best):
                 best = row
@@ -309,8 +309,8 @@ def train_run(task, train, validation, seed, build, pad_id, device, steps=STEPS,
 
 def evaluate_model(model, task, sets_eval, pad_id, device):
     probabilities = {name: predict(model, s["input_ids"], pad_id, device)[0] for name, s in sets_eval.items()}
-    preds = {name: e1.decide(p, task) for name, p in probabilities.items()}
-    result = (e1.detection_metrics if task == DETECTION else e1.diagnosis_metrics)(sets_eval, probabilities, preds)
+    preds = {name: classicos.decide(p, task) for name, p in probabilities.items()}
+    result = (classicos.detection_metrics if task == DETECTION else classicos.diagnosis_metrics)(sets_eval, probabilities, preds)
     return result, probabilities, preds
 
 
@@ -340,7 +340,7 @@ def full_data_runs(tasks, sets, checkpoints, build, pad_id, device, log):
                 del model
                 folder.mkdir(parents=True, exist_ok=False)
                 save_file(state, folder / "model.safetensors")
-                record["checkpoint_sha256"] = e1.sha(folder / "model.safetensors")
+                record["checkpoint_sha256"] = classicos.sha(folder / "model.safetensors")
                 record["training_validation_probabilities"] = best_probabilities.tolist()
                 data.write_new(folder / "run.json", data.json_bytes(record))
                 log(f"{task} seed {seed}: point {record['best']['point']} metric {record['best']['validation_metric']:.4f} "
@@ -350,7 +350,7 @@ def full_data_runs(tasks, sets, checkpoints, build, pad_id, device, log):
 
 
 def load_checkpoint(model, folder, expected_sha):
-    if e1.sha(folder / "model.safetensors") != expected_sha:
+    if classicos.sha(folder / "model.safetensors") != expected_sha:
         raise data.ModelError(f"{folder}: checkpoint differs from its run.json")
     model.load_state_dict(load_file(folder / "model.safetensors"))
     return model
@@ -362,9 +362,9 @@ def shuffled_control(sets, build, pad_id, device):
     train = dict(sets["train"], cause=y)
     record, _, probabilities, model = train_run(DIAGNOSIS, train, sets["validation"], c1.SHUFFLE_SEED, build, pad_id, device)
     del model
-    preds = e1.decide(probabilities, DIAGNOSIS)
+    preds = classicos.decide(probabilities, DIAGNOSIS)
     return {"seed": c1.SHUFFLE_SEED, "train_labels_changed": sum(a != b for a, b in zip(y, sets["train"]["cause"])),
-            "best_point": record["best"], "last_point": record["history"][-1], "validation_at_best_point": e1.multiclass_metrics(
+            "best_point": record["best"], "last_point": record["history"][-1], "validation_at_best_point": classicos.multiclass_metrics(
                 sets["validation"]["cause"], probabilities, preds), "seconds": record["seconds"], "peak_vram_mb": record["peak_vram_mb"],
             "note": "the best point is picked on validation, so its Macro-F1 is an optimistic reading of the control"}
 
@@ -402,15 +402,15 @@ def stage_select(args):
             raise data.ModelError(f"{task}/{seed}: the saved checkpoint does not reproduce its best validation point")
         key = {"tarefa": task, "modelo": args.model, "regime": FULL, "sorteio": "", "semente": seed}
         results.append({**key, "params": None, "best": record["best"], "metrics": result})
-        predictions += e1.prediction_rows(task, key, validation_only, probabilities, preds, origin="e2")
+        predictions += classicos.prediction_rows(task, key, validation_only, probabilities, preds, origin="e2")
     del model
-    analysis = e1.validation_analysis(sets, templates, [r for r in results if r["tarefa"] == DIAGNOSIS],
+    analysis = classicos.validation_analysis(sets, templates, [r for r in results if r["tarefa"] == DIAGNOSIS],
                                       [p for p in predictions if p["tarefa"] == DIAGNOSIS])
     record = {"created_local": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "model": args.model, "encoder": str(args.encoder),
               "checkpoints": str(args.checkpoints), "gpu_check": gpu, "verification": verification, "environment": c2.environment(),
               "full_data_runs": [{k: v for k, v in r.items() if k != "training_validation_probabilities"} for r in runs],
               "checkpoint_reload_vs_training": consistency, "shuffled_labels_control": control, "validation_results": results,
-              "validation_aggregated": e1.aggregate(results), "validation_predictions": predictions,
+              "validation_aggregated": classicos.aggregate(results), "validation_predictions": predictions,
               "validation_analysis": analysis, "e1_validation_analysis": e1_validation_comparison(),
               "seconds": time.perf_counter() - started}
     data.write_new(args.output / SELECTION_FILE, data.json_bytes(record))
@@ -496,11 +496,11 @@ def stage_evaluate(args):
 
     # 2. marker, then the test, once
     marker = {"created_local": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "model": args.model, "encoder": str(args.encoder),
-              "selection_sha256": e1.sha(selection_path), "reads": 1,
+              "selection_sha256": classicos.sha(selection_path), "reads": 1,
               "note": "written before the test set is opened; a second evaluation is refused"}
     data.write_new(base / TEST_MARKER, data.json_bytes(marker))
     gate = c1v2.TestGate()
-    sets["test"] = tokenize(e1.attach(gate.read(data_v2.DERIVED_DIR, VIEW, templates, marker["selection_sha256"]), causes, "test"),
+    sets["test"] = tokenize(classicos.attach(gate.read(data_v2.DERIVED_DIR, VIEW, templates, marker["selection_sha256"]), causes, "test"),
                             templates, tokenizer)
     runs_total = data_v2.check_disjoint({s: sets[s]["rows"] for s in sets})
     sets_eval = evaluated_sets(sets, include_test=True)
@@ -515,7 +515,7 @@ def stage_evaluate(args):
         result, probabilities, preds = evaluate_model(model, task, sets_eval, pad, args.device)
         key = {"tarefa": task, "modelo": args.model, "regime": FULL, "sorteio": "", "semente": seed}
         results.append({**key, "params": None, "best": record["best"], "metrics": result})
-        predictions += e1.prediction_rows(task, key, sets_eval, probabilities, preds, origin="e2")
+        predictions += classicos.prediction_rows(task, key, sets_eval, probabilities, preds, origin="e2")
         if task == DIAGNOSIS and seed == c2.SEEDS[0]:
             latency = c2.measure_inference(model, tokenizer, sets["test"]["text"], args.device)
             latency["model"] = f"{task}, seed {seed}, best epoch {record['best']['point']}; test texts, as the D1"
@@ -533,8 +533,8 @@ def stage_evaluate(args):
     # 5. low-resource runs: train, best point on validation, then validation and tests once; weights are not written
     low_dir = base / LOW_DIR
     low_results, low_records = [], []
-    for draw in e1.read_draws():
-        indexes = e1.draw_indexes(sets["train"], draw)
+    for draw in classicos.read_draws():
+        indexes = classicos.draw_indexes(sets["train"], draw)
         train = subset(sets["train"], indexes)
         for task in TASKS:
             name = f"{task}_{draw['fraction']}_{draw['index']}"
@@ -546,7 +546,7 @@ def stage_evaluate(args):
             if main_metric(task, labels_of(sets["validation"], task), preds["validation"]) != record["best"]["validation_metric"]:
                 raise data.ModelError(f"{name}: best state does not reproduce its validation point (test already evaluated): stop")
             key = {"tarefa": task, "modelo": args.model, "regime": str(draw["fraction"]), "sorteio": draw["index"], "semente": draw["seed"]}
-            rows = e1.prediction_rows(task, key, sets_eval, probabilities, preds, origin="e2")
+            rows = classicos.prediction_rows(task, key, sets_eval, probabilities, preds, origin="e2")
             run = {**key, "params": None, "best": record["best"], "metrics": result}
             record.update({"fraction": draw["fraction"], "draw": draw["index"], "by_cause": draw["by_cause"]})
             data.write_new(low_dir / f"{name}.json", data.json_bytes({"run": run, "training": record, "predictions": rows}))
@@ -557,7 +557,7 @@ def stage_evaluate(args):
 
     # 6. outputs
     results += low_results
-    aggregated = e1.aggregate(results)
+    aggregated = classicos.aggregate(results)
     for a in aggregated:
         a["origem"] = "e2"
     aggregated += copied
@@ -581,7 +581,7 @@ def stage_evaluate(args):
     files = {
         "config.json": data.json_bytes({
             "model": args.model, "encoder": str(args.encoder), "checkpoints": str(args.checkpoints), "environment": c2.environment(),
-            "gpu_check": {"select": selection["gpu_check"], "evaluate": gpu}, "verification": verification, "preregistro_sha256": e1.PREREGISTRO_SHA256,
+            "gpu_check": {"select": selection["gpu_check"], "evaluate": gpu}, "verification": verification, "preregistro_sha256": classicos.PREREGISTRO_SHA256,
             "inputs": data_v2.verify_inputs(data_v2.DERIVED_DIR), "view": VIEW, "classes": list(CLASSES),
             "fine_tuning": pre["hiperparametros"]["fine_tuning_bert_2b_luk"], "low_resource_budget": pre["orcamento_baixos_recursos"]["bert_2b_luk"],
             "effective": {"learning_rate": LEARNING_RATE, "steps": STEPS, "evaluation_every": EVAL_EVERY, "warmup_steps": WARMUP_STEPS,
@@ -599,9 +599,9 @@ def stage_evaluate(args):
         "metrics.json": data.json_bytes({"runs": results + (d1_runs if args.detection_full == "copy" else []), "aggregated": aggregated,
                                          "cost": cost}),
         "metrics.csv": data.csv_bytes(["tarefa", "modelo", "regime", "runs", "origem", "conjunto", "metrica", "media", "desvio"],
-                                      e1.metric_rows(aggregated)),
-        "predictions_diagnostico.csv": data.csv_bytes(e1.PRED_DIAG, [p for p in predictions if p["tarefa"] == DIAGNOSIS]),
-        "predictions_deteccao.csv": data.csv_bytes(e1.PRED_DET, [p for p in predictions if p["tarefa"] == DETECTION]),
+                                      classicos.metric_rows(aggregated)),
+        "predictions_diagnostico.csv": data.csv_bytes(classicos.PRED_DIAG, [p for p in predictions if p["tarefa"] == DIAGNOSIS]),
+        "predictions_deteccao.csv": data.csv_bytes(classicos.PRED_DET, [p for p in predictions if p["tarefa"] == DETECTION]),
     }
     for name, content in files.items():
         data.write_new(base / name, content)

@@ -7,7 +7,7 @@
   allocation; with 4 classes and size 4 this gives 1 of each).
 - Inside each class: random.Random(seed).sample over the windows of that class in the order of labels/sets/train.csv, classes in
   the order above, the same mechanism as the feasibility study. The same subsets serve detection (binary C3 label) and diagnosis.
-Run from the repository root after models.e0.causa: python -m models.e0.sorteios."""
+Run from the repository root after models.avaliacao_ampliada.causa: python -m models.avaliacao_ampliada.sorteios."""
 import argparse
 import json
 import math
@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from models.common import data, data_v2
-from models.e0 import causa
+from models.avaliacao_ampliada import causa
 
 DRAWS_FILE = "low_resource_draws.json"
 FRACTIONS = (0.01, 0.05, 0.10)

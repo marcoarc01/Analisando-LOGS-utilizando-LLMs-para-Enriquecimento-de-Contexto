@@ -2,9 +2,9 @@
 diagnosis with full data, the detection with full data (only what the C4 does not have) and the low-resource draws of both tasks.
 
 Stages, each a separate process, run from the repository root with C:\\tcc-venv\\cenario1:
-  python -m models.e1.e1 select    hashes of the pre-registration; grid of the diagnosis, shuffled-labels control and every validation
+  python -m models.avaliacao_ampliada.classicos select    hashes of the pre-registration; grid of the diagnosis, shuffled-labels control and every validation
                                    result; writes selection.json. The test is not opened.
-  python -m models.e1.e1 evaluate  needs selection.json; writes test_access.json before the test is read, refuses a second evaluation;
+  python -m models.avaliacao_ampliada.classicos evaluate  needs selection.json; writes test_access.json before the test is read, refuses a second evaluation;
                                    refits every model (validation results must equal those of select) and evaluates the test once.
 No statistical test is run here (D6). Outputs go to results/e1 and are never overwritten."""
 import argparse
@@ -13,6 +13,7 @@ import csv
 import datetime as dt
 import importlib.metadata
 import json
+import re
 import statistics
 import sys
 import time
@@ -25,12 +26,13 @@ from sklearn.preprocessing import label_binarize
 from models.cenario1 import cenario1 as c1
 from models.cenario1 import cenario1_v2 as c1v2
 from models.common import data, data_v2, metrics, window_text as wt
-from models.e0 import causa, sorteios
+from models.avaliacao_ampliada import causa, sorteios
 from models.exploratorio import poucos_dados
 
 VIEW = "controlada"
 E0_DIR = data_v2.DERIVED_DIR / "e0"
 PREREGISTRO_SHA256 = "b5c129e56ff20d0a02f9e8e67bd154eb9386139f66f477afd2a5aec905d12c25"
+CODE_MOVES = data_v2.DERIVED_DIR / "reorganizacao_codigo.json"
 OUTPUT = data_v2.RESULTS_DIR / "e1"
 C4_DIR = data_v2.RESULTS_DIR / "cenario1"
 MIXED_TEXTS = data_v2.RESULTS_DIR / "viabilidade" / "textos_mistos.csv"
@@ -57,6 +59,52 @@ def sha(path):
     return data.sha256_bytes(Path(path).read_bytes())
 
 
+def read_code_moves():
+    """Old path -> entry of reorganizacao_codigo.json, for the code moved from models/e0, e1 and e2 to models/avaliacao_ampliada."""
+    if not CODE_MOVES.exists():
+        return {}
+    entries = json.loads(CODE_MOVES.read_text(encoding="utf-8"))["arquivos"]
+    return {e["caminho_antigo"]: e for e in entries if e["caminho_novo"]}
+
+
+def undo_diff(new_text, diff):
+    """Old text from the new text and its unified diff (difflib, kept line endings): every context and added line must match."""
+    new_lines, old_lines, position, index = new_text.splitlines(keepends=True), [], 0, 0
+    while index < len(diff) and not diff[index].startswith("@@"):
+        index += 1
+    while index < len(diff):
+        match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", diff[index])
+        if match is None:
+            raise data.ModelError(f"reorganizacao_codigo.json: bad hunk header {diff[index]!r}")
+        start, length = int(match.group(1)), int(match.group(2) or 1)
+        start = start - 1 if length else start
+        if start < position:
+            raise data.ModelError("reorganizacao_codigo.json: hunks out of order")
+        old_lines += new_lines[position:start]
+        position, index = start, index + 1
+        while index < len(diff) and not diff[index].startswith("@@"):
+            tag, text = diff[index][0], diff[index][1:]
+            if tag in " +":
+                if position >= len(new_lines) or new_lines[position] != text:
+                    raise data.ModelError("reorganizacao_codigo.json: the diff does not match the new file")
+                position += 1
+            if tag in " -":
+                old_lines.append(text)
+            index += 1
+    return "".join(old_lines + new_lines[position:])
+
+
+def check_moved_code(name, expected, move):
+    """A moved file of the pre-registration is accepted only if the pre-registered hash is the old hash of the correspondence, the new
+    path has the new hash of the correspondence and undoing the recorded diff on the new file gives back content with the old hash."""
+    content = (REPO / move["caminho_novo"]).read_bytes()
+    if move["sha256_antigo"] != expected:
+        raise data.ModelError(f"code {name}: old hash of reorganizacao_codigo.json differs from the pre-registration")
+    if data.sha256_bytes(content) != move["sha256_novo"]:
+        raise data.ModelError(f"code {move['caminho_novo']} differs from reorganizacao_codigo.json")
+    if data.sha256_bytes(undo_diff(content.decode("utf-8"), move["diff"]).encode("utf-8")) != expected:
+        raise data.ModelError(f"code {move['caminho_novo']}: undoing the recorded diff does not give the pre-registered file")
+
 def verify_preregistration():
     """SHA-256 of preregistro.json and of every file it references; the parts this stage follows must match the code it reuses."""
     pre_path = E0_DIR / "preregistro.json"
@@ -74,8 +122,11 @@ def verify_preregistration():
         if sha(data_v2.DERIVED_DIR / name) != expected:
             raise data.ModelError(f"input {name} differs from the pre-registration")
         checked[name] = expected
+    moves = read_code_moves()
     for name, expected in pre["code_sha256"].items():
-        if sha(REPO / name) != expected:
+        if name in moves:
+            check_moved_code(name, expected, moves[name])
+        elif sha(REPO / name) != expected:
             raise data.ModelError(f"code {name} differs from the pre-registration")
         checked[name] = expected
     for model in ("bert_mlm_2b", "bert_luk"):

@@ -1,7 +1,7 @@
 """E0, part 3: pre-registration of the extended evaluation (JSON outside the repository), written before any training of it.
 Hyperparameters are read from the code and the result files of Scenarios 1 and 2, not typed in. Checkpoint manifests are verified.
 Then the SHA-256 of preregistro.json is written to preregistro.sha256. Run from the repository root with C:\\tcc-venv\\bert after
-models.e0.causa and models.e0.sorteios: python -m models.e0.preregistro."""
+models.avaliacao_ampliada.causa and models.avaliacao_ampliada.sorteios: python -m models.avaliacao_ampliada.preregistro."""
 import argparse
 import datetime as dt
 import json
@@ -12,14 +12,14 @@ from pathlib import Path
 from models.cenario1 import cenario1 as c1
 from models.cenario2 import cenario2 as c2m
 from models.common import data, data_v2, window_text as wt
-from models.e0 import causa, sorteios
+from models.avaliacao_ampliada import causa, sorteios
 from models.exploratorio import poucos_dados
 
 PRE_FILE = "preregistro.json"
 HASH_FILE = "preregistro.sha256"
 REPO = Path(__file__).resolve().parents[2]
 CHECKPOINTS = {"2b": Path(r"C:\tcc-data\checkpoints\mlm2b-full"), "luk": Path(r"C:\tcc-data\checkpoints\luk-full")}
-CODE = ("models/e0/causa.py", "models/e0/sorteios.py", "models/e0/preregistro.py", "models/common/window_text.py", "models/common/data_v2.py",
+CODE = ("models/avaliacao_ampliada/causa.py", "models/avaliacao_ampliada/sorteios.py", "models/avaliacao_ampliada/preregistro.py", "models/common/window_text.py", "models/common/data_v2.py",
         "models/common/metrics.py", "models/cenario1/cenario1.py", "models/cenario1/cenario1_v2.py", "models/cenario2/cenario2.py",
         "models/exploratorio/poucos_dados.py")
 INPUTS = ("labels/labels.csv", "labels/sets/train.csv", "labels/sets/validation.csv", "labels/sets/test.csv", "labels/manifest.sha256",

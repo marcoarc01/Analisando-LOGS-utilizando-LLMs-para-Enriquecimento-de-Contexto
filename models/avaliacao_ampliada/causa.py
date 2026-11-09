@@ -7,7 +7,7 @@
 - An anomalous window of the baseline must not exist: it stops everything.
 The condition is control metadata: it is used here only to write the answer key and is not written to cause_labels.csv.
 Of the test set only ids, C3 status and label, anomaly type and condition are taken (labels.csv is projected on those columns);
-no window text of the test is opened. Run from the repository root: python -m models.e0.causa."""
+no window text of the test is opened. Run from the repository root: python -m models.avaliacao_ampliada.causa."""
 import argparse
 import collections
 import csv

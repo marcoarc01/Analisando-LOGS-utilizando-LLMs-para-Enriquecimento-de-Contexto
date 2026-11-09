@@ -1,7 +1,7 @@
 import unittest
 
 from models.common import data
-from models.e0 import causa as c
+from models.avaliacao_ampliada import causa as c
 
 
 def row(status, condition, split="train", label=None, anomaly_type="", run="r1", k="1", line="1"):
